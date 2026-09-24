@@ -83,6 +83,16 @@ SLIDER_HANDLE_COLOR = screen_gallery.TEXT_MUTED_COLOR
 SLIDER_HANDLE_ACTIVE_COLOR = screen_gallery.TEXT_PRIMARY_COLOR
 ENTRY_CHAR_WIDTH = 7  # tk.Entry 的 width 是字元數不是 px；量測過 Calibri 10pt 下約等於 55px，落在 55~65px 目標範圍
 
+# Apply 按鈕的主要動作配色：2026-09-24 使用者回饋原本用
+# screen_gallery.ACCENT_COLOR（#FFD700，跟 Favorite 星號同一顆亮黃色）
+# 太亮，改成同色系但降低飽和度/亮度的柔和金銅色，仍然跟卡片背景
+# ROW_COLOR（#3d3d45）有明顯對比、一眼看得出是主要動作，但不會像原本
+# 那麼刺眼。只有這顆 Apply 按鈕用這組顏色，不影響 ACCENT_COLOR 原本在
+# Favorite/Checkbox 上的用法。
+APPLY_BUTTON_BG_COLOR = '#B99A4E'
+APPLY_BUTTON_HOVER_COLOR = '#A5872F'
+APPLY_BUTTON_TEXT_COLOR = '#1f1f1f'
+
 # (payload_key, 顯示文字, 最小值, 最大值)
 # 2026-09-22 第三輪使用者要求拿掉 Colour Red/Blue 的 warning 提示文字，
 # 不需要任何 warning——原本的第五個欄位（提示文字）整個移除。
@@ -115,14 +125,21 @@ back_button_image = None  # PhotoImage 沒有其他參照會被 GC 回收，用�
 status_label = None
 apply_button = None  # Apply 進行中需要 disable，見 on_apply_button_click()
 
+# 2026-09-24 使用者要求改成 demo 風格：不再常駐顯示「Status: Ready」這種
+# 工程用文字，平常 status_label 是空字串。只有錯誤（載入/套用失敗、Live
+# View 無法連線)才顯示簡短訊息，Apply 成功則短暫顯示幾秒後自動清空——
+# _status_clear_after_id 記著那個自動清空的 after() id，下一次要顯示新
+# 訊息時先取消掉，避免「舊訊息的清空計時器」晚一步把新訊息蓋掉。
+STATUS_SUCCESS_COLOR = '#4CAF50'  # 跟 screen_settings.py 的 Dashcam Switch ON 同一個「成功/已完成」語意
+STATUS_TRANSIENT_DURATION_MS = 2500
+_status_clear_after_id = None
+
 # ---- Live View（2026-09-23 新增）----
 LIVE_VIEW_TICK_INTERVAL_MS = 67  # 約 15fps，跟 video_source.py 的 RTSPVideoSource 預設 fps 對齊
-LIVE_VIEW_CONNECTED_COLOR = '#4CAF50'  # 跟 screen_settings.py 的 Dashcam Switch ON 顏色一致，同一套「已連線/已開啟」語意
 
 _live_view_controller = None  # build_screen() 傳進來的 live_view_controller.LiveViewController 實例，可能是 None
 _live_view_active = False  # 目前這個頁面是不是「應該」在跑 Live View（_live_view_tick() 靠這個決定要不要繼續排下一次）
 _live_view_image_ref = None  # PhotoImage 沒有其他參照會被 GC 回收，用模組變數存住
-live_view_status_label = None
 live_view_canvas = None
 live_view_retry_button = None
 
@@ -294,6 +311,99 @@ def _create_iq_row(parent, key, label_text, min_value, max_value):
     entry.bind('<FocusOut>', entry_change_handler)
 
 
+SCROLLBAR_MIN_THUMB_HEIGHT_PX = 20  # thumb 太細會很難點中拖曳，內容很長時強制保留這個最小高度
+
+
+class _ArrowlessScrollbar:
+    """左側 IQ 參數區的垂直捲軸：只有 track + thumb，沒有上下箭頭。
+
+    2026-09-24 使用者回報 tk.Scrollbar 原本的上下箭頭明顯沒有置中、看起來
+    歪掉，要求直接拿掉箭頭（不用再花時間調置中）。classic tk.Scrollbar
+    沒有「隱藏箭頭」這個選項（elementborderwidth 只能拿掉箭頭的立體邊框，
+    箭頭本體一定會畫出來）；改用 ttk.Scrollbar 自訂 layout 拿掉箭頭的話，
+    Windows 預設的 vista ttk 主題會用原生淺色外觀畫 track/thumb（顏色
+    客製化大多不會生效——跟 _MacDarkButton 說明過的 tk.Button 在 macOS
+    Aqua 主題下顏色不生效是同一類限制），會讓這個頁面的捲軸看起來跟其他
+    頁面的深色風格不一致，而且 ttk.Style 的 theme_use() 是整個 App 共用
+    的全域設定，貿然切換主題可能連帶影響 Race Track 頁面那顆 ttk
+    Combobox 的外觀——使用者明確要求「不要影響其他頁面」，所以不採用
+    ttk 這條路。
+
+    這裡改用一個小 Canvas 自己畫 track（背景色）+ thumb（矩形），完全自
+    己掌控外觀跟有沒有箭頭，也完全不碰任何 ttk 全域設定，只有這個檔案
+    自己用，不影響其他頁面既有的 tk.Scrollbar（screen_settings.py／
+    screen_race_track.py 完全不動）。對外相容 tk 的
+    `yscrollcommand=scrollbar.set` 介面（Canvas 的 `<Configure>`/捲動都會
+    呼叫 set(first, last)），呼叫端透過 attach() 傳入拖曳時要呼叫的
+    yview_moveto 函式——跟真正的 tk.Scrollbar(command=...) 是同一種
+    「呼叫端決定捲動哪個 Canvas」的用法，只是這裡用 attach() 而不是建構
+    子時的 command 參數。"""
+
+    def __init__(self, parent, width, trough_color, thumb_color, thumb_hover_color):
+        self.canvas = tk.Canvas(parent, width=width, bg=trough_color, highlightthickness=0)
+        self._width = width
+        self._thumb_color = thumb_color
+        self._thumb_hover_color = thumb_hover_color
+        self._thumb_id = self.canvas.create_rectangle(0, 0, width, 0, fill=thumb_color, width=0)
+        self._first = 0.0
+        self._last = 1.0
+        self._drag_start_y_root = None
+        self._drag_start_first = None
+        self._yview_moveto_callback = None
+
+        self.canvas.bind('<Configure>', lambda event: self._redraw_thumb())
+        self.canvas.tag_bind(self._thumb_id, '<Enter>',
+                              lambda event: self.canvas.itemconfig(self._thumb_id, fill=self._thumb_hover_color))
+        self.canvas.tag_bind(self._thumb_id, '<Leave>',
+                              lambda event: self.canvas.itemconfig(self._thumb_id, fill=self._thumb_color))
+        self.canvas.tag_bind(self._thumb_id, '<ButtonPress-1>', self._on_thumb_press)
+        self.canvas.tag_bind(self._thumb_id, '<B1-Motion>', self._on_thumb_drag)
+
+    def attach(self, yview_moveto_callback):
+        """拖曳 thumb 時要呼叫的函式，通常是 content_canvas.yview_moveto。"""
+        self._yview_moveto_callback = yview_moveto_callback
+
+    def pack(self, **kwargs):
+        self.canvas.pack(**kwargs)
+
+    def set(self, first, last):
+        """相容 tk 的 yscrollcommand 介面：Canvas 內容/可視範圍改變時會
+        被呼叫，first/last 是目前可視範圍在整個內容裡的比例（0~1）。"""
+        self._first = float(first)
+        self._last = float(last)
+        self._redraw_thumb()
+
+    def _redraw_thumb(self):
+        track_height = self.canvas.winfo_height()
+        if track_height <= 1:
+            return  # widget 剛建立、還沒 realize，量到的高度沒有意義
+
+        top = self._first * track_height
+        bottom = self._last * track_height
+        if bottom - top < SCROLLBAR_MIN_THUMB_HEIGHT_PX:
+            center = (top + bottom) / 2
+            top = max(0, center - SCROLLBAR_MIN_THUMB_HEIGHT_PX / 2)
+            bottom = min(track_height, top + SCROLLBAR_MIN_THUMB_HEIGHT_PX)
+            top = bottom - SCROLLBAR_MIN_THUMB_HEIGHT_PX
+        self.canvas.coords(self._thumb_id, 0, top, self._width, bottom)
+
+    def _on_thumb_press(self, event):
+        self._drag_start_y_root = event.y_root
+        self._drag_start_first = self._first
+
+    def _on_thumb_drag(self, event):
+        if self._yview_moveto_callback is None or self._drag_start_y_root is None:
+            return
+        track_height = self.canvas.winfo_height()
+        if track_height <= 1:
+            return
+        dragged_fraction = (event.y_root - self._drag_start_y_root) / track_height
+        visible_fraction = self._last - self._first
+        new_first = self._drag_start_first + dragged_fraction
+        new_first = max(0.0, min(1.0 - visible_fraction, new_first))
+        self._yview_moveto_callback(new_first)
+
+
 def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=None,
                   on_get_iq_settings=None):
     """建立 IQ Adjustment 畫面。
@@ -313,13 +423,13 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
     on_get_iq_settings()：進入頁面時呼叫一次（見 DA005ControlPanel.pyw 的
     _enter_iq_adjustment_screen() -> load_iq_settings_from_device()），
     回傳目前裝置真實的 7 個 IQ 欄位 plain dict，用來取代 IQ_DEFAULTS
-    當作畫面初始顯示值（不影響 Restore Factory Defaults 按鈕——那顆
+    當作畫面初始顯示值（不影響 Restore Defaults 按鈕——那顆
     按鈕固定恢復成 IQ_DEFAULTS，不是這裡讀到的即時值）。傳 None 的話
     load_iq_settings_from_device() 直接安全地什麼都不做，畫面會停在
     IQ_DEFAULTS。"""
     global on_back_callback, on_apply_iq_callback, on_get_iq_settings_callback
     global back_button_image, status_label, apply_button
-    global _live_view_controller, live_view_status_label, live_view_canvas, live_view_retry_button
+    global _live_view_controller, live_view_canvas, live_view_retry_button
 
     on_back_callback = on_back
     on_apply_iq_callback = on_apply_iq
@@ -369,11 +479,14 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
                             width=-(COLUMN_GAP_PX // 2))
 
     content_canvas = tk.Canvas(scroll_container, bg=screen_gallery.BACKGROUND_COLOR, highlightthickness=0)
-    content_scrollbar = tk.Scrollbar(
-        scroll_container, orient='vertical', command=content_canvas.yview,
-        width=8, bd=0, highlightthickness=0, relief='flat', elementborderwidth=0,
-        bg=screen_gallery.CONTROL_COLOR, activebackground=screen_gallery.CONTROL_HOVER_COLOR,
-        troughcolor=screen_gallery.BACKGROUND_COLOR)
+    # 2026-09-24 改用 _ArrowlessScrollbar（見檔案開頭類別說明）取代
+    # tk.Scrollbar，只拿掉上下箭頭，track/thumb 顏色跟原本一致
+    # （CONTROL_COLOR/CONTROL_HOVER_COLOR/BACKGROUND_COLOR），滑鼠滾輪
+    # 邏輯完全不動（還是綁在 content_canvas 上，見下面 _on_mouse_wheel）。
+    content_scrollbar = _ArrowlessScrollbar(
+        scroll_container, width=8, trough_color=screen_gallery.BACKGROUND_COLOR,
+        thumb_color=screen_gallery.CONTROL_COLOR, thumb_hover_color=screen_gallery.CONTROL_HOVER_COLOR)
+    content_scrollbar.attach(content_canvas.yview_moveto)
     content_inner = tk.Frame(content_canvas, bg=screen_gallery.BACKGROUND_COLOR)
     content_inner_window_id = content_canvas.create_window((0, 0), window=content_inner, anchor='nw')
     content_inner.bind('<Configure>',
@@ -405,17 +518,28 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
     for key, label_text, min_value, max_value in IQ_FIELD_SPECS:
         _create_iq_row(card, key, label_text, min_value, max_value)
 
-    # ---- [Control]：Reset / Apply ----
+    # ---- [Control]：Restore Defaults / Apply ----
+    # 2026-09-24 使用者要求：Apply 是主要動作，視覺上要比 Restore Defaults
+    # 更明顯，但原本用 screen_gallery.ACCENT_COLOR（亮黃色）太刺眼，改用
+    # APPLY_BUTTON_BG_COLOR 這組柔和金銅色（見檔案開頭常數說明）。
+    # Restore Defaults 維持原本的次要按鈕樣式不變。兩顆按鈕字型/pady 都
+    # 來自同一個 style_dark_button()，高度自然一致，只有 padx（寬度）跟
+    # 顏色不同——這一輪只換顏色，不動排版/間距。
     control_row = tk.Frame(card, bg=screen_gallery.ROW_COLOR)
     control_row.pack(fill='x', padx=16, pady=(4, 8))
     reset_button = screen_gallery.style_dark_button(
-        tk.Button(control_row, text='Restore Factory Defaults', command=lambda: on_reset_button_click()))
+        tk.Button(control_row, text='Restore Defaults', command=lambda: on_reset_button_click()))
     reset_button.pack(side='left')
     apply_button = screen_gallery.style_dark_button(
-        tk.Button(control_row, text='Apply', command=lambda: on_apply_button_click()))
+        tk.Button(control_row, text='Apply', command=lambda: on_apply_button_click()),
+        bg_color=APPLY_BUTTON_BG_COLOR, hover_color=APPLY_BUTTON_HOVER_COLOR, fg_color=APPLY_BUTTON_TEXT_COLOR)
+    apply_button.config(padx=24)  # 比 Restore Defaults 的預設 padx=14 稍寬，符合「Apply 可以稍微寬一點」
     apply_button.pack(side='right')
 
-    status_label = tk.Label(card, text='Status: Ready', font=('Calibri', 9),
+    # 平常是空字串（不常駐顯示任何文字），只有錯誤/短暫成功提示才會被
+    # _set_error_status()/_set_transient_status() 寫入內容，見那兩個函式
+    # 的說明。
+    status_label = tk.Label(card, text='', font=('Calibri', 9),
                              bg=screen_gallery.ROW_COLOR, fg=screen_gallery.TEXT_SECONDARY_COLOR)
     status_label.pack(anchor='w', padx=16, pady=(0, 14))
 
@@ -426,8 +550,11 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
     # 又捲動一次蓋掉。
     content_canvas.after_idle(lambda: content_canvas.yview_moveto(0))
 
-    # ---- 右側：Live View Preview。2026-09-23：從靜態 placeholder 改成
-    # 真的顯示畫面，但這支檔案完全不知道畫面來源是 RTSP 還是 UVC——只透過
+    # ---- 右側：Live View Preview。2026-09-24 使用者要求改成 demo 風格：
+    # 不顯示「Live View Preview」標題、不顯示「Connected - RTSP」這種
+    # 工程來源文字——正常/連線中都不顯示任何文字，只有畫面本身；只有連線
+    # 失敗時才在黑底中央顯示一句簡短訊息（不含 RTSP/UVC/exception 細節）。
+    # 這支檔案完全不知道畫面來源是 RTSP 還是 UVC——只透過
     # _live_view_controller（build_screen() 傳進來的
     # live_view_controller.LiveViewController 實例）操作，見檔案開頭說明。
     preview_frame = tk.Frame(body, bg='#000000')
@@ -435,36 +562,64 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
                          relwidth=1 - LEFT_COLUMN_RATIO, relheight=1,
                          width=-(COLUMN_GAP_PX // 2 + 20))
 
-    preview_title = tk.Label(preview_frame, text='Live View Preview', font=('Calibri', 12, 'bold'),
-                              bg='#000000', fg=screen_gallery.TEXT_SECONDARY_COLOR)
-    preview_title.pack(pady=(16, 4))
-
-    live_view_status_label = tk.Label(preview_frame, text='Connecting...', font=('Calibri', 11),
-                                       bg='#000000', fg=screen_gallery.TEXT_MUTED_COLOR, justify='center')
-    live_view_status_label.pack(pady=(0, 6))
-
     # 實際畫面畫在這個 Canvas 上（create_image），跟 screen_recording.py/
     # screen_race_track.py 的 Live View 顯示邏輯是同一種做法（黑底 Canvas
     # + 定期用最新一張畫面覆蓋），差別只是這裡的畫面來源是透過
-    # LiveViewController 拿，不是直接呼叫 api.py。
+    # LiveViewController 拿，不是直接呼叫 api.py。沒有標題/狀態文字佔用
+    # 空間了，padding 縮到最小，讓畫面盡量填滿整個黑色預覽區。
     live_view_canvas = tk.Canvas(preview_frame, bg='#000000', highlightthickness=0)
-    live_view_canvas.pack(fill='both', expand=True, padx=16, pady=(0, 8))
+    live_view_canvas.pack(fill='both', expand=True, padx=4, pady=4)
 
-    # Retry 按鈕只有連線失敗（error 狀態）才會顯示，預設不 pack()。
+    # 連線失敗時的訊息直接畫在 live_view_canvas 中央（見
+    # _render_live_view_message()），不再另外用一個常駐的 Label。Retry
+    # 按鈕只有連線失敗（error 狀態）才會顯示，用 place() 疊在 Canvas
+    # 正中央下方，預設不 place()。
     live_view_retry_button = screen_gallery.style_dark_button(
         tk.Button(preview_frame, text='Retry Live View', command=lambda: on_retry_live_view_click()))
 
     return frame
 
 
-def set_status_text(text):
-    status_label.config(text=f'Status: {text}')
+def _clear_status():
+    global _status_clear_after_id
+    status_label.config(text='')
+    _status_clear_after_id = None
+
+
+def _cancel_pending_status_clear():
+    """顯示新訊息前先取消掉上一則訊息排定的自動清空，避免舊訊息的計時器
+    晚一步把新訊息蓋掉（例如 Apply 才剛失敗顯示錯誤，卻被更早一次成功
+    訊息的自動清空計時器蓋掉）。"""
+    global _status_clear_after_id
+    if _status_clear_after_id is not None:
+        status_label.after_cancel(_status_clear_after_id)
+        _status_clear_after_id = None
+
+
+def _set_error_status(text):
+    """錯誤訊息：持續顯示，不會自動消失，直到使用者下一次操作觸發新的
+    狀態。訊息文字本身刻意寫得簡短、不含 HTTP status/exception stack 等
+    工程細節——那些細節仍然用 print() 留在 console 給開發者看，見各個
+    呼叫端。"""
+    global _status_clear_after_id
+    _cancel_pending_status_clear()
+    status_label.config(text=text, fg=ERROR_TEXT_COLOR)
+
+
+def _set_transient_status(text):
+    """成功提示：短暫顯示幾秒後自動消失（STATUS_TRANSIENT_DURATION_MS），
+    不會像錯誤訊息那樣一直留著——demo 情境下「常駐的 Status 文字」本身就
+    是使用者要求拿掉的東西，成功提示只是一閃即逝的確認，不是常駐狀態。"""
+    global _status_clear_after_id
+    _cancel_pending_status_clear()
+    status_label.config(text=text, fg=STATUS_SUCCESS_COLOR)
+    _status_clear_after_id = status_label.after(STATUS_TRANSIENT_DURATION_MS, _clear_status)
 
 
 def _apply_values_to_fields(values):
     """把一組 7 個 IQ 值（plain dict）寫回畫面上的 Entry/Slider，並清掉
     每個欄位的錯誤文字。load_iq_settings_from_device()（GET 到裝置真實值）
-    跟 on_reset_button_click()（Restore Factory Defaults，固定用
+    跟 on_reset_button_click()（Restore Defaults，固定用
     IQ_DEFAULTS）共用這個函式，差別只在於「值從哪裡來」。"""
     for key, field in _iq_field_widgets.items():
         value = values.get(key, IQ_DEFAULTS.get(key))
@@ -479,12 +634,11 @@ def _apply_values_to_fields(values):
 
 
 def on_reset_button_click():
-    """Restore Factory Defaults：把畫面上 7 個 IQ 欄位恢復成 IQ_DEFAULTS
+    """Restore Defaults：把畫面上 7 個 IQ 欄位恢復成 IQ_DEFAULTS
     （見檔案開頭說明），不是恢復成進頁面 GET 到的裝置目前值——只改畫面
     顯示，不呼叫任何 API、不會立即送到 Dashcam，使用者還是要另外按
     Apply 才會真的套用到裝置上。"""
     _apply_values_to_fields(IQ_DEFAULTS)
-    set_status_text('Ready')
 
 
 def load_iq_settings_from_device():
@@ -513,12 +667,14 @@ def load_iq_settings_from_device():
 
 def _on_load_done(values, error):
     if error is not None:
+        # 完整的例外內容只印到 console 給開發者看，畫面上只顯示簡短、不含
+        # 工程細節的訊息（2026-09-24 使用者要求，demo 情境不需要看到
+        # exception/HTTP 細節）。
         print(f'[IQ Adjustment] 讀取目前 IQ 設定失敗: {error}')
-        set_status_text(f'Failed to load current settings: {error}')
+        _set_error_status('Failed to load IQ settings.')
         return
 
     _apply_values_to_fields(values)
-    set_status_text('Loaded current settings from device.')
 
 
 def _collect_iq_payload():
@@ -570,17 +726,18 @@ def on_apply_button_click():
     調整效果，不需要因為送了一次設定就重新連線。"""
     payload = _collect_iq_payload()
     if payload is None:
-        set_status_text('Please fix invalid values before applying.')
+        # 不額外顯示 status 文字——每個欄位自己的 error_label 已經在
+        # _collect_iq_payload() 裡標出哪裡有問題，不需要再疊一句常駐提示。
         return
 
     if on_apply_iq_callback is None:
-        # 理論上呼叫端應該已經接上真正的函式，這裡保留 placeholder 只是
-        # 保險，避免呼叫端漏接時直接 AttributeError。
-        set_status_text('(Placeholder) IQ settings ready to apply.')
+        # 理論上呼叫端應該已經接上真正的函式，這裡保留這個分支只是保險，
+        # 避免呼叫端漏接時直接 AttributeError；不需要對使用者顯示任何
+        # 文字（正常情況下不會走到這裡）。
+        print('[IQ Adjustment] on_apply_iq_callback 尚未接上，Apply 沒有實際送出')
         return
 
     apply_button.config(state='disabled')
-    set_status_text('Applying...')
 
     def worker():
         try:
@@ -596,10 +753,12 @@ def on_apply_button_click():
 def _on_apply_done(success, error):
     apply_button.config(state='normal')
     if success:
-        set_status_text('IQ settings applied successfully.')
+        _set_transient_status('IQ settings applied.')
     else:
+        # 完整例外內容只印到 console，畫面上只顯示簡短訊息（理由同
+        # _on_load_done()）。
         print(f'[IQ Adjustment] Apply 失敗: {error}')
-        set_status_text(f'Apply failed: {error}')
+        _set_error_status('Failed to apply IQ settings.')
 
 
 # ============================================================
@@ -624,8 +783,8 @@ def start_live_view():
     if _live_view_active:
         return  # 已經在跑（tick 迴圈還在排），不要重複啟動
     _live_view_active = True
-    live_view_retry_button.pack_forget()
-    live_view_status_label.config(text='Connecting...', fg=screen_gallery.TEXT_MUTED_COLOR)
+    live_view_retry_button.place_forget()
+    live_view_canvas.delete('all')  # 連線中不顯示任何文字，見檔案開頭 2026-09-24 說明
     _live_view_controller.start_live_view()
     _live_view_tick()
 
@@ -642,7 +801,7 @@ def stop_live_view():
     if live_view_canvas is not None:
         live_view_canvas.delete('all')
     if live_view_retry_button is not None:
-        live_view_retry_button.pack_forget()
+        live_view_retry_button.place_forget()
 
 
 def on_retry_live_view_click():
@@ -650,8 +809,8 @@ def on_retry_live_view_click():
     真的重新連線一次，不是只清掉錯誤文字假裝好了。"""
     if _live_view_controller is None:
         return
-    live_view_retry_button.pack_forget()
-    live_view_status_label.config(text='Connecting...', fg=screen_gallery.TEXT_MUTED_COLOR)
+    live_view_retry_button.place_forget()
+    live_view_canvas.delete('all')  # 連線中不顯示任何文字，見檔案開頭 2026-09-24 說明
     _live_view_controller.retry_live_view()
     if not _live_view_active:
         # 正常情況下使用者會看到 Retry 按鈕，代表頁面還開著、_live_view_active
@@ -662,25 +821,30 @@ def on_retry_live_view_click():
 
 def _live_view_tick():
     """main thread 定期執行：跟 live_view_controller 要一次最新狀態/畫面，
-    只顯示「目前拿到的這個狀態」，不會因為跟不上就累積或卡住。"""
+    只顯示「目前拿到的這個狀態」，不會因為跟不上就累積或卡住。
+
+    2026-09-24 使用者要求改成 demo 風格：connected/connecting 兩種狀態都
+    不顯示任何文字（只有畫面，或連線中的空黑畫面）——不再顯示
+    「Connected - RTSP」這種來源技術資訊。只有 error 狀態才在畫面中央顯示
+    一句簡短、不含 RTSP/UVC/exception 細節的訊息（error_message 完全不會
+    被顯示出來，只是這裡不用它，不是被刻意忽略而遺漏處理）。"""
     if not _live_view_active or _live_view_controller is None:
         return
 
-    status, error_message, source_label = _live_view_controller.get_status()
+    status, _error_message, _source_label = _live_view_controller.get_status()
 
     if status == live_view_controller_module.STATUS_CONNECTED:
-        live_view_retry_button.pack_forget()
-        live_view_status_label.config(text=f'Connected - {source_label}', fg=LIVE_VIEW_CONNECTED_COLOR)
+        live_view_retry_button.place_forget()
         frame = _live_view_controller.get_latest_frame()
         if frame is not None:
             _render_live_view_frame(*frame)
     elif status == live_view_controller_module.STATUS_ERROR:
-        live_view_canvas.delete('all')
-        live_view_status_label.config(text=f'Live View unavailable\nError: {error_message}', fg=ERROR_TEXT_COLOR)
-        live_view_retry_button.pack(pady=(0, 16))
+        _render_live_view_message('Live View unavailable')
+        live_view_retry_button.place(relx=0.5, rely=0.62, anchor='n')
     else:  # connecting / idle
-        live_view_retry_button.pack_forget()
-        live_view_status_label.config(text='Connecting...', fg=screen_gallery.TEXT_MUTED_COLOR)
+        live_view_retry_button.place_forget()
+        live_view_canvas.delete('live_view_frame')
+        live_view_canvas.delete('live_view_message')
 
     live_view_canvas.after(LIVE_VIEW_TICK_INTERVAL_MS, _live_view_tick)
 
@@ -704,5 +868,24 @@ def _render_live_view_frame(width, height, frame_bytes):
     frame_image = Image.frombytes('RGB', (width, height), frame_bytes).resize((display_width, display_height))
     _live_view_image_ref = ImageTk.PhotoImage(frame_image)
     live_view_canvas.delete('live_view_frame')
+    live_view_canvas.delete('live_view_message')  # 剛連上時清掉之前可能殘留的錯誤訊息文字
     live_view_canvas.create_image(canvas_width // 2, canvas_height // 2, anchor='center',
                                    image=_live_view_image_ref, tags='live_view_frame')
+
+
+def _render_live_view_message(text):
+    """在 live_view_canvas 正中央畫一句簡短文字（目前只有連線失敗時會
+    呼叫），不使用另外的常駐 Label——這樣訊息永遠是「疊在黑色預覽區中
+    央」，不管 Canvas 目前多大都一樣置中，跟 _render_live_view_frame() 的
+    置中邏輯一致。Canvas 還沒有真正尺寸時直接跳過，理由同
+    _render_live_view_frame()。"""
+    canvas_width = live_view_canvas.winfo_width()
+    canvas_height = live_view_canvas.winfo_height()
+    if canvas_width <= 1 or canvas_height <= 1:
+        return
+
+    live_view_canvas.delete('live_view_frame')
+    live_view_canvas.delete('live_view_message')
+    live_view_canvas.create_text(canvas_width // 2, canvas_height // 2, text=text,
+                                  fill=screen_gallery.TEXT_SECONDARY_COLOR, font=('Calibri', 11),
+                                  justify='center', tags='live_view_message')

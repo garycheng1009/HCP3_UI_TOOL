@@ -932,51 +932,118 @@ bind_nav_tab_hover(settings_menu_button, 'settings')
 
 # ---- Live View 按鈕：放在 Gear 左邊，跟 Gear 同進退（Settings 畫面時一起
 # 隱藏，見 _repack_top_bar_right_side() 的 should_show_gear） ----
-# 2026-09-21 新增。純文字按鈕（不需要另外做 icon 素材），三種狀態靠文字跟
-# 底色區分：未啟用（灰底）／Connecting...（過渡色，還沒收到第一張畫面）／
-# ● Live View（跟 Active Tab 同一套亮色，代表真的已經在顯示畫面）。
-# 沒有套用 bind_nav_tab_hover()——那支函式的 on_leave 會把 bg 寫回
-# NAV_BAR_COLOR，會蓋掉這裡自己管理的啟用/連線中狀態顏色，故意不用。
-LIVE_VIEW_BUTTON_TEXT_INACTIVE = 'Live View'
-LIVE_VIEW_BUTTON_TEXT_CONNECTING = 'Connecting...'
-LIVE_VIEW_BUTTON_TEXT_ACTIVE = '● Live View'
+# 2026-09-21 新增，2026-09-24 使用者要求改版：原本用整顆按鈕的底色/文字
+# 三種狀態（未啟用灰底／Connecting... 過渡色／● Live View 亮底）表示連線
+# 狀態，改成「固定深灰背景＋固定白色文字＋一顆會變色的狀態圓點」——背景
+# 永遠是 NAV_BAR_COLOR、文字永遠是白色的 LIVE_VIEW_BUTTON_TEXT，不再隨
+# 連線狀態改變；只有圓點顏色在變。使用者只定義了兩種顏色（灰＝未連線、
+# 綠＝已連線），Connecting 這個過渡態沒有獨立的第三種顏色，這裡讓它沿用
+# 「未連線」的灰點（跟 inactive 視覺上一致，只是還沒收到第一張畫面），
+# 不是遺漏、是配合使用者這次只要兩種狀態顏色的明確要求。
+# 圓點用 ui_shapes.make_circle_photo_image()（跟 screen_settings.py 的
+# Toggle Switch 圓形握把同一套繪圖工具）畫兩張固定顏色的小圓點圖片。
+#
+# 2026-09-24 第二輪使用者要求：圓點放大到約 8px、圓點跟文字的水平間距
+# 縮小到約 7px。原本用單一 Label/Button 的 compound='left' 做法沒有辦法
+# 精確控制「圖片跟文字之間的間距」——那個間距是各平台 Tk 內建 layout
+# 決定的固定值，不能用 padx/pady 調整（padx/pady 只會加在整個內容
+# 外面，不是加在圖片文字中間）。改成一個 Frame 裡面各自放一顆圓點
+# Label 跟一顆文字 Label、side='left' 排列，中間那個 7px 的間距直接用
+# 文字 Label 的 padx=(7, 0) 精確控制；pack() 預設就會把每個 widget 在
+# 它分配到的列高度中垂直置中（anchor 預設是 'center'），圓點（8px）跟
+# 文字（字型高度較高）兩者高度不同時，一樣會各自垂直置中在同一列，看
+# 起來就是「同一組、垂直置中」。
+# 這個 Frame 現在取代原本的 Label/Button 成為 live_view_button，其他地方
+# （_repack_top_bar_right_side() 的 pack()/pack_forget()）當它是同一顆
+# 「小部件」在操作，不需要跟著改。
+LIVE_VIEW_BUTTON_TEXT = 'Live View'
+LIVE_VIEW_DOT_DIAMETER = 8  # 使用者要求「放大至約 8px」
+LIVE_VIEW_DOT_TEXT_GAP_PX = 7  # 使用者要求圓點跟文字的水平間距「縮小至約 7px」
+LIVE_VIEW_DOT_COLOR_INACTIVE = screen_gallery.TEXT_MUTED_COLOR  # 灰色：未連線／Connecting 中
+LIVE_VIEW_DOT_COLOR_ACTIVE = '#4CAF50'  # 綠色：已連線，跟 screen_settings.py 的 Dashcam Switch ON 同一個「已連線/已開啟」語意
 
-live_view_is_active = False  # 真的已經在顯示畫面（不含 Connecting 中間態）
+# 2026-09-24 第四輪使用者要求：拿掉第三輪加的「selected」樣式（常駐底色＋
+# 底線）——回報底線很醜、按下後背景反灰不會恢復、選取狀態一直留著，而且
+# 這顆按鈕本來就不需要做成分頁 Tab 那種「目前選取」效果。改成只有一種
+# feedback：滑鼠案下短暫變色、放開立刻恢復，不再有任何常駐狀態色。
+# LIVE_VIEW_BUTTON_PRESSED_COLOR 借用既有的 NAV_TAB_HOVER_COLOR（跟其他
+# Tab 案下/hover 同一組「輕微變亮」語意，不新發明顏色）。平常（沒有案著）
+# 背景固定是 NAV_BAR_COLOR，圓點顏色（灰/綠）繼續只代表連線狀態，兩者
+# 完全沒有交集。
+LIVE_VIEW_BUTTON_PRESSED_COLOR = NAV_TAB_HOVER_COLOR
 
-if sys.platform == 'darwin':
-    live_view_button = tk.Label(top_bar, text=LIVE_VIEW_BUTTON_TEXT_INACTIVE,
-                                 bg=NAV_BAR_COLOR, fg=NAV_TAB_TEXT_COLOR,
-                                 font=('Calibri', 11), bd=0, relief='flat',
-                                 highlightthickness=0, padx=12, pady=4, cursor='hand2')
-    live_view_button.bind('<Button-1>', lambda event: on_live_view_button_clicked())
-else:
-    live_view_button = tk.Button(top_bar, text=LIVE_VIEW_BUTTON_TEXT_INACTIVE, command=lambda: on_live_view_button_clicked(),
-                                  bg=NAV_BAR_COLOR, fg=NAV_TAB_TEXT_COLOR, activebackground=NAV_BAR_COLOR,
-                                  font=('Calibri', 11), bd=0, relief='flat',
-                                  highlightthickness=0, padx=12, pady=4, cursor='hand2')
+live_view_is_active = False  # 真的已經在顯示畫面（不含 Connecting 中間態）——只影響圓點顏色
+
+# PhotoImage 沒有其他參照會被 GC 回收，用模組變數存住（跟這個檔案其他
+# icon 圖片——gear_icon_image 等——同一個既有慣例）。
+live_view_dot_image_inactive = ui_shapes.make_circle_photo_image(
+    LIVE_VIEW_DOT_DIAMETER, fill=LIVE_VIEW_DOT_COLOR_INACTIVE)
+live_view_dot_image_active = ui_shapes.make_circle_photo_image(
+    LIVE_VIEW_DOT_DIAMETER, fill=LIVE_VIEW_DOT_COLOR_ACTIVE)
+
+live_view_button = tk.Frame(top_bar, bg=NAV_BAR_COLOR, cursor='hand2', padx=12, pady=4)
+live_view_dot_label = tk.Label(live_view_button, image=live_view_dot_image_inactive,
+                                bg=NAV_BAR_COLOR, bd=0, highlightthickness=0, cursor='hand2')
+live_view_dot_label.pack(side='left')
+live_view_text_label = tk.Label(live_view_button, text=LIVE_VIEW_BUTTON_TEXT, bg=NAV_BAR_COLOR, fg='white',
+                                 font=('Calibri', 11), bd=0, highlightthickness=0, cursor='hand2')
+live_view_text_label.pack(side='left', padx=(LIVE_VIEW_DOT_TEXT_GAP_PX, 0))
 
 
-def _set_live_view_button_style(text, bg_color, fg_color):
-    if sys.platform == 'darwin':
-        live_view_button.config(text=text, bg=bg_color, fg=fg_color)
-    else:
-        live_view_button.config(text=text, bg=bg_color, fg=fg_color, activebackground=bg_color)
+def _live_view_button_widgets():
+    return (live_view_button, live_view_dot_label, live_view_text_label)
+
+
+def _set_live_view_button_background(bg_color):
+    """Frame／圓點 Label／文字 Label 三個 widget 的背景要一起換色，不然
+    會看到中間留一塊沒跟著變色的縫。"""
+    for widget in _live_view_button_widgets():
+        widget.config(bg=bg_color)
+
+
+def _on_live_view_button_pressed(event=None):
+    """滑鼠案下：背景變成 LIVE_VIEW_BUTTON_PRESSED_COLOR，並照原本邏輯
+    觸發啟動/停止。恢復完全交給 _on_live_view_button_released()，這裡不
+    排任何計時器——沒有計時器就不會有「使用者很快案放、計時器卻還沒到就
+    把後來的狀態蓋掉」這種競態，也不會有「忘記恢復」的常駐色問題。"""
+    _set_live_view_button_background(LIVE_VIEW_BUTTON_PRESSED_COLOR)
+    on_live_view_button_clicked()
+
+
+def _on_live_view_button_released(event=None):
+    """滑鼠放開：立刻恢復成固定的 NAV_BAR_COLOR。Tk 在案下的那個 widget
+    上有隱含的 mouse grab，就算放開時游標已經移出按鈕範圍，這個 release
+    事件還是會確實觸發到同一顆 widget 上，不會漏掉、也不會卡在按下的
+    顏色。"""
+    _set_live_view_button_background(NAV_BAR_COLOR)
+
+
+# Frame 本身跟兩顆子 Label 都要能點擊觸發 on_live_view_button_clicked()
+# ——沒有 command= 可以像 tk.Button 那樣自動處理，這裡三個都各自綁
+# <Button-1>/<ButtonRelease-1>，跟 mac 原本（tk.Label 沒有 command）就是
+# 這種綁法一致，Windows 這邊改成一樣的 Label+bind 寫法後也不再需要
+# sys.platform 分支（原本要分 mac/Windows 是因為 macOS Aqua 主題下
+# tk.Button 的 bg/fg 不會生效，這裡完全沒用到 tk.Button，兩個平台可以
+# 共用同一份寫法）。
+for _live_view_clickable_widget in _live_view_button_widgets():
+    _live_view_clickable_widget.bind('<Button-1>', _on_live_view_button_pressed)
+    _live_view_clickable_widget.bind('<ButtonRelease-1>', _on_live_view_button_released)
 
 
 def _set_live_view_button_inactive():
     global live_view_is_active
     live_view_is_active = False
-    _set_live_view_button_style(LIVE_VIEW_BUTTON_TEXT_INACTIVE, NAV_BAR_COLOR, NAV_TAB_TEXT_COLOR)
+    live_view_dot_label.config(image=live_view_dot_image_inactive)
 
 
 def _set_live_view_button_connecting():
-    _set_live_view_button_style(LIVE_VIEW_BUTTON_TEXT_CONNECTING, NAV_TAB_HOVER_COLOR, NAV_TAB_TEXT_COLOR)
+    live_view_dot_label.config(image=live_view_dot_image_inactive)
 
 
 def _set_live_view_button_active():
     global live_view_is_active
     live_view_is_active = True
-    _set_live_view_button_style(LIVE_VIEW_BUTTON_TEXT_ACTIVE, NAV_TAB_ACTIVE_COLOR, NAV_TAB_ACTIVE_TEXT_COLOR)
+    live_view_dot_label.config(image=live_view_dot_image_active)
 
 
 def _handle_live_view_error(message):
