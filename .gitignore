@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+
+# PyInstaller 打包產物，不需要進版控，重新執行 pyinstaller 就能重建
+build/
+dist/
+release/
+
+# 開發用虛擬環境，用 requirements.txt 在任何機器上重建即可，不用進版控
+.venv/
+
+# 148MB、GPL 授權的 ffmpeg.exe（gyan.dev full build）+ mac 版 ffmpeg，
+# 不進版控。上傳/部署到其他機器前，記得手動把這兩個檔案複製到同樣的路徑：
+# tools/mac_windows_General/runtime/ffmpeg/ffmpeg.exe（Windows）
+# tools/mac_windows_General/runtime/ffmpeg/ffmpeg（macOS，記得 chmod +x）
+# 來源：本機 C:\ffmpeg\bin\ffmpeg.exe（或官方 gyan.dev full build）
+runtime/ffmpeg/
+
+# macOS Finder/AppleDouble 殘留檔，從 mac 傳到 Windows 檔案系統時常見，
+# 沒有實際用途
+.DS_Store
+._*

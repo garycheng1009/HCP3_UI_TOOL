@@ -1,0 +1,29 @@
+# DA005ControlPanel — 打包/開發環境需要的 pip 套件
+# 用來重建打包用的 Python 環境：
+#     pip install -r requirements.txt
+# tkinter 是標準庫的一部分（隨 Python 安裝），不需要另外 pip install，
+# 但 Python 安裝時要記得勾選 tcl/tk 選項（官方安裝包預設會裝）。
+
+Pillow==10.3.0
+requests==2.31.0
+protobuf==4.24.3
+googleapis-common-protos==1.63.0      # 提供 google.type.latlng_pb2 / interval_pb2，容易漏裝
+opencv-python==4.12.0.88
+numpy==2.2.6
+reportlab==5.0.0
+svglib==2.2.0
+lxml==6.1.1
+setuptools==70.0.0
+
+# reportlab 5.x 把點陣圖繪製（renderPM.drawToFile()，screen_fake_ui.py
+# 的大頭貼 user.svg -> PNG 轉換要用）拆成外掛 backend，本身不再內建，
+# 沒裝這三個套件會直接丟 RenderPMError，不是「裝了更好、沒裝也能動」的
+# 選配套件。reportlab/svglib 自己的 setup.py 都沒有把它們列為相依套件
+# （Codex review 2026-08-20 抓到的落差），一定要在 requirements.txt 明確列出。
+rlPyCairo==0.4.0
+pycairo==1.29.1
+freetype-py==2.5.1
+
+# 打包用（不是程式本身的 runtime 依賴，但打包這台機器需要裝）
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7
