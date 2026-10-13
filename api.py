@@ -62,6 +62,14 @@ def get_device_address():
     return _device_host, _device_port
 
 
+def get_liveview_rtsp_url():
+    """依目前的 DVR 位址組出 Live View 用的 RTSP URL。2026-10-13 新增：
+    DA005ControlPanel.pyw 建立共用 RTSPVideoSource 時用這個，不再用
+    video_source.py 寫死的 DEFAULT_RTSP_URL；下面舊的 start_liveview() 也
+    改用同一個函式，兩邊組法一致。"""
+    return f'rtsp://[{_device_host}]:554/h264'
+
+
 def _get_base_url():
     # IPv6 位址(例如 DVR 的 FD53:...)網址裡要用中括號包起來，一般 IPv4/主機名稱不用
     if ':' in _device_host:
@@ -1410,7 +1418,7 @@ def start_liveview(on_error=None):
         return
 
     width, height = _LIVEVIEW_FRAME_SIZE
-    rtsp_url = f'rtsp://[{_device_host}]:554/h264'
+    rtsp_url = get_liveview_rtsp_url()
     command = [
         ffmpeg_path,
         '-rtsp_transport', 'udp',

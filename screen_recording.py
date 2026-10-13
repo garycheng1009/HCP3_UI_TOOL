@@ -66,6 +66,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import api
 import audi_pb2
+import live_view_controller as live_view_controller_module
 import screen_gallery
 import ui_shapes
 from resource_paths import resource_path
@@ -2080,8 +2081,12 @@ def on_preview_click(event):
 
 
 # ============================================================
-# Live View：把 api.py 提供的最新 RTSP 畫面畫在 preview_canvas 上
+# Live View：把 LiveViewController 提供的最新畫面畫在 preview_canvas 上
 # ============================================================
+# 2026-10-13 改成透過 DA005ControlPanel.pyw 建立的「共用 LiveViewController」
+# 取得畫面（跟 IQ Adjustment 同一個，預設 UVC，env=rtsp 時是 RTSP），不再
+# 直接呼叫 api.get_latest_liveview_frame()。這支檔案不 import video_source.py，
+# 不知道實際來源是 UVC 還是 RTSP。
 # 2026-09-21 新增。刻意不去動 update_preview_image()/show_preview() 這些既有
 # 縮圖函式——Live View 畫面直接疊在縮圖上面（用獨立的 'live_view_frame'
 # tag），開始/結束只是「多蓋一層」跟「把那一層拿掉」，底下原本的縮圖
@@ -2091,41 +2096,59 @@ def on_preview_click(event):
 _live_view_active = False
 _live_view_first_frame_seen = False
 _live_view_on_first_frame_callback = None
+_live_view_on_error_callback = None
+_live_view_controller = None  # enter_live_view_mode() 傳進來的共用 LiveViewController
+_live_view_owner = None       # 呼叫 controller 時用的 owner 名稱（首頁是 'home'）
 live_view_image_ref = None  # PhotoImage 一定要保留參照，不然會被 GC 回收
 
-LIVE_VIEW_TICK_INTERVAL_MS = 67  # 約 15fps，跟 api.py 的 ffmpeg fps 設定對齊
+LIVE_VIEW_TICK_INTERVAL_MS = 67  # 約 15fps，跟 video_source.py 的輸出 fps 對齊
 
 
-def enter_live_view_mode(on_first_frame=None):
+def enter_live_view_mode(controller, owner, on_first_frame=None, on_error=None):
     """切換 preview_canvas 開始顯示 Live View 畫面：蓋掉（不刪除）Play Button
-    疊圖，開始定期跟 api.py 要最新一張畫面。已經在 Live View 中就直接
+    疊圖，開始定期跟 controller 要最新一張畫面。已經在 Live View 中就直接
     return，不會重複啟動 tick 迴圈。
+
+    controller / owner：共用的 LiveViewController 跟這個頁面的 owner 名稱，
+    啟動/停止 stream 是呼叫端（DA005ControlPanel.pyw）的責任，這裡只負責顯示。
 
     on_first_frame：收到第一張完整畫面時呼叫一次（沒有參數），用來讓呼叫端
     （DA005ControlPanel.pyw）把按鈕從「Connecting...」切成「● Live View」。
-    這個 callback 是在 preview_canvas.after() 排出來的、main thread 上執行，
+    on_error(message)：controller 回報錯誤時呼叫一次（連線失敗、UVC 中斷）。
+    兩個 callback 都是在 preview_canvas.after() 排出來的、main thread 上執行，
     可以放心直接更新 Tkinter widget。"""
     global _live_view_active, _live_view_first_frame_seen, _live_view_on_first_frame_callback
+    global _live_view_on_error_callback, _live_view_controller, _live_view_owner
     if _live_view_active:
         return
     _live_view_active = True
     _live_view_first_frame_seen = False
     _live_view_on_first_frame_callback = on_first_frame
+    _live_view_on_error_callback = on_error
+    _live_view_controller = controller
+    _live_view_owner = owner
     preview_canvas.delete('play_button_overlay')
     _live_view_tick()
 
 
 def _live_view_tick():
-    """main thread 定期執行：跟 api.py 要一次最新畫面，有拿到就畫上去，
+    """main thread 定期執行：跟 controller 要一次最新狀態/畫面，有拿到就畫上去，
     永遠只顯示「目前拿到的這一張」，跟不上就跟不上，不會排隊累積。"""
     global _live_view_first_frame_seen, live_view_image_ref
     if not _live_view_active:
         return
 
-    frame_bytes = api.get_latest_liveview_frame()
-    if frame_bytes is not None:
-        width, height = api.get_liveview_frame_size()
-        # 640x360 跟 PREVIEW_SIZE（700x394）都是 16:9，resize() 不會變形。
+    status, error_message, _source_label = _live_view_controller.get_status(_live_view_owner)
+    if status == live_view_controller_module.STATUS_ERROR:
+        # 交給呼叫端處理（停止 stream、恢復縮圖、按鈕回到未啟用），這裡不再排下一次 tick
+        if _live_view_on_error_callback:
+            _live_view_on_error_callback(error_message)
+        return
+
+    frame = _live_view_controller.get_latest_frame(_live_view_owner)
+    if frame is not None:
+        width, height, frame_bytes = frame
+        # UVC 1280x720 / RTSP 640x360 跟 PREVIEW_SIZE（700x394）都是 16:9，resize() 不會變形。
         frame_image = Image.frombytes('RGB', (width, height), frame_bytes).resize(PREVIEW_SIZE)
         live_view_image_ref = ImageTk.PhotoImage(frame_image)
         preview_canvas.delete('live_view_frame')

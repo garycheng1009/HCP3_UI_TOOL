@@ -142,6 +142,9 @@ _status_clear_after_id = None
 LIVE_VIEW_TICK_INTERVAL_MS = 67  # 約 15fps，跟 video_source.py 的 RTSPVideoSource 預設 fps 對齊
 
 _live_view_controller = None  # build_screen() 傳進來的 live_view_controller.LiveViewController 實例，可能是 None
+# 2026-10-13：LiveViewController 改成首頁跟 IQ Adjustment 共用同一個，
+# 呼叫 start/stop/get_status 時都要帶這個 owner 名稱，見 live_view_controller.py 開頭說明
+LIVE_VIEW_OWNER = 'iq_adjustment'
 _live_view_active = False  # 目前這個頁面是不是「應該」在跑 Live View（_live_view_tick() 靠這個決定要不要繼續排下一次）
 _live_view_image_ref = None  # PhotoImage 沒有其他參照會被 GC 回收，用模組變數存住
 live_view_canvas = None
@@ -790,7 +793,7 @@ def start_live_view():
     _live_view_active = True
     live_view_retry_button.place_forget()
     live_view_canvas.delete('all')  # 清掉上一次的畫面；下面的 _live_view_tick() 會立刻畫上「Starting Live View...」
-    _live_view_controller.start_live_view()
+    _live_view_controller.start_live_view(LIVE_VIEW_OWNER)
     _live_view_tick()
 
 
@@ -802,7 +805,7 @@ def stop_live_view():
     global _live_view_active
     _live_view_active = False
     if _live_view_controller is not None:
-        _live_view_controller.stop_live_view()
+        _live_view_controller.stop_live_view(LIVE_VIEW_OWNER)
     if live_view_canvas is not None:
         live_view_canvas.delete('all')
     if live_view_retry_button is not None:
@@ -818,7 +821,7 @@ def on_retry_live_view_click():
     # 重新連線期間跟第一次進頁面一樣顯示「Starting Live View...」，
     # 不要留一片黑畫面（下一次 _live_view_tick() 也會持續畫這行字，直到拿到第一張畫面）
     _render_live_view_message('Starting Live View...')
-    _live_view_controller.retry_live_view()
+    _live_view_controller.retry_live_view(LIVE_VIEW_OWNER)
     if not _live_view_active:
         # 正常情況下使用者會看到 Retry 按鈕，代表頁面還開著、_live_view_active
         # 應該已經是 True；這裡是防呆，避免萬一狀態不一致時 tick 迴圈沒有
@@ -846,11 +849,11 @@ def _live_view_tick():
     if not _live_view_active or _live_view_controller is None:
         return
 
-    status, _error_message, _source_label = _live_view_controller.get_status()
+    status, _error_message, _source_label = _live_view_controller.get_status(LIVE_VIEW_OWNER)
 
     if status == live_view_controller_module.STATUS_CONNECTED:
         live_view_retry_button.place_forget()
-        frame = _live_view_controller.get_latest_frame()
+        frame = _live_view_controller.get_latest_frame(LIVE_VIEW_OWNER)
         if frame is not None:
             _render_live_view_frame(*frame)
     elif status == live_view_controller_module.STATUS_ERROR:

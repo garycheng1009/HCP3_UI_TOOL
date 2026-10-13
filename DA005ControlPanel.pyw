@@ -159,10 +159,10 @@ def show_screen(name):
         # 這個畫面時如果還在跑，必須自動停止，避免殘留 ffmpeg 子行程。
         stop_live_view_if_active()
 
-    # 2026-09-23 新增：IQ Adjustment 進頁面會自動開始 Live View（獨立的
-    # RTSP/未來 UVC 來源，跟上面 Recording 首頁那個 Live View 是完全分開
-    # 的兩套），離開這個畫面時必須自動停止，避免殘留 ffmpeg 子行程或第二次
-    # 進來變成兩條 stream。
+    # 2026-09-23 新增：IQ Adjustment 進頁面會自動開始 Live View，離開這個
+    # 畫面時必須自動停止，避免殘留 ffmpeg 子行程或第二次進來變成兩條 stream。
+    # 2026-10-13：首頁跟 IQ Adjustment 共用同一個 LiveViewController，stop
+    # 只會停掉自己 owner 的 stream，不會誤停另一個頁面的。
     if previous_screen_name == 'iq_adjustment' and name != 'iq_adjustment':
         screen_iq_adjustment.stop_live_view()
 
@@ -1047,25 +1047,27 @@ def _set_live_view_button_active():
     live_view_dot_label.config(image=live_view_dot_image_active)
 
 
+# 2026-10-13：首頁 Live View 改走共用的 shared_live_view_controller（跟 IQ
+# Adjustment 同一個，見下面 create_shared_live_view_controller()），不再呼叫
+# api.start_liveview()。呼叫 controller 時都要帶這個 owner 名稱。
+HOME_LIVE_VIEW_OWNER = 'home'
+
+
 def _handle_live_view_error(message):
-    """api.start_liveview() 的 on_error：可能從背景 thread 呼叫（RTSP 連線
-    中斷是背景 thread 偵測到的），這裡統一用 window.after(0, ...) 排回
-    main thread 才能安全動 Tkinter widget。"""
-    def restore():
-        print(f'[Live View] {message}')
-        api.stop_liveview()
-        screen_recording.exit_live_view_mode()
-        _set_live_view_button_inactive()
-    window.after(0, restore)
+    """screen_recording 的 Live View tick 偵測到 controller 回報錯誤時呼叫
+    （連線失敗、UVC 中斷）。tick 本身就在 main thread，可以直接動 Tkinter。"""
+    print(f'[Live View] 首頁 Live View 錯誤：{message}')
+    stop_live_view_if_active()
 
 
 def stop_live_view_if_active():
     """統一的 Live View 停止入口：按鈕本身點擊停止、切換分頁、關閉視窗都
     走這裡。沒有在跑（包含還在 Connecting 的過渡狀態）就直接 return，
-    可以安全重複呼叫。"""
-    if not live_view_is_active and not api.is_liveview_running():
+    可以安全重複呼叫。stop 本身在 controller 的背景 worker 執行，不會卡 UI。"""
+    is_home_requested = shared_live_view_controller.is_requested_by(HOME_LIVE_VIEW_OWNER)
+    if not live_view_is_active and not is_home_requested:
         return
-    api.stop_liveview()
+    shared_live_view_controller.stop_live_view(HOME_LIVE_VIEW_OWNER)
     screen_recording.exit_live_view_mode()
     _set_live_view_button_inactive()
 
@@ -1074,7 +1076,8 @@ def on_live_view_button_clicked():
     """未啟用（含 Connecting 中）時點擊 = 啟動；已經在顯示畫面時點擊 = 停止。
     如果目前不在 Recording 分頁，先切過去（Live View 借用的是 Recording
     首頁右側的縮圖區域，只有在那個畫面才有地方顯示）。"""
-    if live_view_is_active or api.is_liveview_running():
+    is_home_requested = shared_live_view_controller.is_requested_by(HOME_LIVE_VIEW_OWNER)
+    if live_view_is_active or is_home_requested:
         stop_live_view_if_active()
         return
 
@@ -1082,12 +1085,12 @@ def on_live_view_button_clicked():
         go_to_recording_screen()
 
     _set_live_view_button_connecting()
-    api.start_liveview(on_error=_handle_live_view_error)
-    if not api.is_liveview_running():
-        # start_liveview() 同步失敗（例如找不到 ffmpeg）：_handle_live_view_error
-        # 已經排好 restore()，這裡不用再進 Live View 模式。
-        return
-    screen_recording.enter_live_view_mode(on_first_frame=_set_live_view_button_active)
+    # start 只是登記要求、馬上返回；連線失敗會由 screen_recording 的 tick
+    # 偵測到錯誤後呼叫 _handle_live_view_error()
+    shared_live_view_controller.start_live_view(HOME_LIVE_VIEW_OWNER)
+    screen_recording.enter_live_view_mode(
+        shared_live_view_controller, HOME_LIVE_VIEW_OWNER,
+        on_first_frame=_set_live_view_button_active, on_error=_handle_live_view_error)
 
 
 def _repack_top_bar_right_side(screen_name):
@@ -1229,35 +1232,44 @@ register_screen('race_track', screen_race_track.build_screen(
 # 這裡塞一個半成品的傳送邏輯。之後要串接時，只要把這裡的 None 換成真正的
 # 函式即可，不用改 screen_iq_adjustment.py。
 #
-# 2026-09-23 新增 Live View：這裡是唯一知道「IQ Adjustment 用哪種影像來源」
+# 2026-09-23 新增 Live View：這裡是唯一知道「Live View 用哪種影像來源」
 # 的地方——實際建構 VideoSource（video_source.py）、包進
-# LiveViewController（live_view_controller.py），screen_iq_adjustment.py
-# 只拿到 live_view_controller 這個物件，完全不知道底下是 RTSP 還是 UVC。
+# LiveViewController（live_view_controller.py），screen_iq_adjustment.py／
+# screen_recording.py 只拿到 live_view_controller 這個物件，完全不知道
+# 底下是 RTSP 還是 UVC。
 #
 # 2026-10-12 改成預設用 UVC（FFmpegUVCVideoSource）。RTSP 保留作 debug /
 # fallback，但「不會」在 UVC 失敗時自動切換（避免把 UVC 的問題藏起來），
 # 要用 RTSP 時手動設定環境變數再啟動：
 #     set DA005_LIVE_VIEW_SOURCE=rtsp
 # UVC 用的是 Windows DirectShow，macOS 一律用 RTSP。
+#
+# 2026-10-13 改成整個 App 只建立「一個」LiveViewController（裡面只有一個
+# VideoSource），首頁（owner='home'）跟 IQ Adjustment（owner=
+# 'iq_adjustment'）共用——同一台 UVC Camera 不會被兩個 ffmpeg 同時開啟。
+# 環境變數一樣同時決定兩個頁面的來源。RTSP 的 URL 用 api.py 目前的 DVR
+# 位址組出來（api.get_liveview_rtsp_url()），不用 video_source.py 寫死的預設值。
 LIVE_VIEW_SOURCE_ENV_NAME = 'DA005_LIVE_VIEW_SOURCE'
 
 
-def create_iq_live_view_controller():
+def create_shared_live_view_controller():
     source_name = os.environ.get(LIVE_VIEW_SOURCE_ENV_NAME, 'uvc').strip().lower()
     if sys.platform != 'win32':
         source_name = 'rtsp'
 
     if source_name == 'rtsp':
-        print('[Live View] IQ Adjustment 影像來源：RTSP')
-        return live_view_controller.LiveViewController(video_source.RTSPVideoSource(), source_label='RTSP')
+        rtsp_url = api.get_liveview_rtsp_url()
+        print(f'[Live View] 首頁 / IQ Adjustment 影像來源：RTSP（{rtsp_url}）')
+        return live_view_controller.LiveViewController(
+            video_source.RTSPVideoSource(rtsp_url=rtsp_url), source_label='RTSP')
 
     if source_name != 'uvc':
         print(f'[Live View] {LIVE_VIEW_SOURCE_ENV_NAME}={source_name} 無法辨識（只接受 uvc / rtsp），改用 UVC')
-    print('[Live View] IQ Adjustment 影像來源：UVC')
+    print('[Live View] 首頁 / IQ Adjustment 影像來源：UVC')
     return live_view_controller.LiveViewController(video_source.FFmpegUVCVideoSource(), source_label='UVC')
 
 
-iq_adjustment_live_view_controller = create_iq_live_view_controller()
+shared_live_view_controller = create_shared_live_view_controller()
 # 2026-09-23 第二輪串接真正的 IQ 設定傳送邏輯：GET/PUT
 # /dashcam/cameraConfiguration 的 protobuf 組包都在 iq_adjustment_service.py
 # （screen_iq_adjustment.py 本身不 import audi_pb2、不直接呼叫
@@ -1265,7 +1277,7 @@ iq_adjustment_live_view_controller = create_iq_live_view_controller()
 register_screen('iq_adjustment', screen_iq_adjustment.build_screen(
     content_container, on_apply_iq=iq_adjustment_service.apply_iq_settings,
     on_back=go_back_from_iq_adjustment,
-    live_view_controller=iq_adjustment_live_view_controller,
+    live_view_controller=shared_live_view_controller,
     on_get_iq_settings=iq_adjustment_service.get_current_iq_settings))
 
 # ============================================================
@@ -1352,17 +1364,17 @@ def on_main_window_close():
     print(f'[Shutdown Perf] window.withdraw()={withdraw_duration:.4f}s（視窗現在應該已經從畫面/工作列消失）')
 
     t_stop_liveview_start = perf_counter()
-    api.stop_liveview()
     # 2026-09-21 新增：把 screen_recording._live_view_tick() 的遞迴 after()
     # 迴圈也一起停掉，不然視窗 destroy() 之後這個排定中的 callback 還會
     # 再跑一次、對著已經銷毀的 preview_canvas 操作。
     screen_recording.exit_live_view_mode()
-    # 2026-09-23 新增：IQ Adjustment 的 Live View 是完全獨立的一套
-    # RTSPVideoSource/ffmpeg 子行程，同樣需要在關閉主程式時停止，不然
-    # process 會變成沒人管的殘留。
+    # IQ Adjustment 的 tick 迴圈也一樣要停
     screen_iq_adjustment.stop_live_view()
+    # 2026-10-13：首頁跟 IQ 共用的 controller，不管目前 owner 是誰都強制停掉，
+    # 而且會等 ffmpeg 真的結束才返回，不會殘留 process
+    shared_live_view_controller.force_stop()
     stop_liveview_duration = perf_counter() - t_stop_liveview_start
-    print(f'[Shutdown Perf] api.stop_liveview()={stop_liveview_duration:.4f}s')
+    print(f'[Shutdown Perf] shared_live_view_controller.force_stop()={stop_liveview_duration:.4f}s')
 
     t_stop_video_start = perf_counter()
     screen_player.stop_video()
