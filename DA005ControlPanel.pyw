@@ -16,6 +16,7 @@ mock_data.py 只保留給離線／沒有接真機時的手動測試用，正式�
 process 也去連線、也開背景執行緒，做一堆等一下就要丟掉的事）。
 """
 
+import os
 import sys
 import inspect
 import threading
@@ -1228,14 +1229,35 @@ register_screen('race_track', screen_race_track.build_screen(
 # 這裡塞一個半成品的傳送邏輯。之後要串接時，只要把這裡的 None 換成真正的
 # 函式即可，不用改 screen_iq_adjustment.py。
 #
-# 2026-09-23 新增 Live View：這裡是唯一知道「IQ Adjustment 目前用 RTSP」
-# 的地方——實際建構 RTSPVideoSource（video_source.py）、包進
+# 2026-09-23 新增 Live View：這裡是唯一知道「IQ Adjustment 用哪種影像來源」
+# 的地方——實際建構 VideoSource（video_source.py）、包進
 # LiveViewController（live_view_controller.py），screen_iq_adjustment.py
 # 只拿到 live_view_controller 這個物件，完全不知道底下是 RTSP 還是 UVC。
-# 之後 RD 提供 UVC，只要把下面這行換成
-# video_source.UVCVideoSource(device_index)，其他都不用改。
-iq_adjustment_live_view_controller = live_view_controller.LiveViewController(
-    video_source.RTSPVideoSource(), source_label='RTSP')
+#
+# 2026-10-12 改成預設用 UVC（FFmpegUVCVideoSource）。RTSP 保留作 debug /
+# fallback，但「不會」在 UVC 失敗時自動切換（避免把 UVC 的問題藏起來），
+# 要用 RTSP 時手動設定環境變數再啟動：
+#     set DA005_LIVE_VIEW_SOURCE=rtsp
+# UVC 用的是 Windows DirectShow，macOS 一律用 RTSP。
+LIVE_VIEW_SOURCE_ENV_NAME = 'DA005_LIVE_VIEW_SOURCE'
+
+
+def create_iq_live_view_controller():
+    source_name = os.environ.get(LIVE_VIEW_SOURCE_ENV_NAME, 'uvc').strip().lower()
+    if sys.platform != 'win32':
+        source_name = 'rtsp'
+
+    if source_name == 'rtsp':
+        print('[Live View] IQ Adjustment 影像來源：RTSP')
+        return live_view_controller.LiveViewController(video_source.RTSPVideoSource(), source_label='RTSP')
+
+    if source_name != 'uvc':
+        print(f'[Live View] {LIVE_VIEW_SOURCE_ENV_NAME}={source_name} 無法辨識（只接受 uvc / rtsp），改用 UVC')
+    print('[Live View] IQ Adjustment 影像來源：UVC')
+    return live_view_controller.LiveViewController(video_source.FFmpegUVCVideoSource(), source_label='UVC')
+
+
+iq_adjustment_live_view_controller = create_iq_live_view_controller()
 # 2026-09-23 第二輪串接真正的 IQ 設定傳送邏輯：GET/PUT
 # /dashcam/cameraConfiguration 的 protobuf 組包都在 iq_adjustment_service.py
 # （screen_iq_adjustment.py 本身不 import audi_pb2、不直接呼叫

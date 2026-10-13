@@ -10,9 +10,9 @@ get_latest_frame() 拿最新狀態/畫面——這支檔案完全不 import tkin
 
 哪一種 VideoSource（RTSP 還是 UVC）是建構時從外面注入進來的（dependency
 injection），這支檔案完全不 import video_source.py 裡任何具體實作類別
-（RTSPVideoSource/UVCVideoSource），只依賴 video_source.VideoSource 那五個
+（RTSPVideoSource/FFmpegUVCVideoSource），只依賴 video_source.VideoSource 那五個
 方法的介面——之後要換成 UVC，只要呼叫端建構 LiveViewController 時傳一個
-UVCVideoSource 進來，這支檔案不用改一行。
+FFmpegUVCVideoSource 進來，這支檔案不用改一行。
 
 實際的背景 thread／pipe 讀取都在 VideoSource 實作內部（例如
 RTSPVideoSource），這裡的 start_live_view()/stop_live_view() 本身很快就
@@ -37,7 +37,7 @@ class LiveViewController:
         self._has_received_frame = False
         # VideoSource.start()/stop() 理論上不該丟例外（RTSPVideoSource 自己
         # 內部已經 try/except 過），但這裡還是包一層安全網——例如
-        # UVCVideoSource 還沒實作、直接 raise NotImplementedError 的情況，
+        # 某個 VideoSource 實作的 start() 直接 raise 例外的情況，
         # 或未來任何 VideoSource 實作忘記自己處理例外，都不能讓呼叫端
         # （Tk 的 button command）整個炸掉，只能反映成 error 狀態。
         self._start_exception_message = None

@@ -3,9 +3,11 @@ video_source.py — 可替換的 Live View 影像來源（VideoSource abstractio
 
 2026-09-23 新增。目的：讓 IQ Adjustment 這種需要即時看畫面的頁面，可以
 呼叫一個共同介面（VideoSource）取得 Live View 畫面，不用知道背後實際上是
-RTSP 還是 UVC。目前只有 RTSPVideoSource 是真的可以用的實作，
-UVCVideoSource 先佔位（見下面的類別說明），之後 RD 提供 UVC 裝置存取方式
-後，只要把 UVCVideoSource 的方法填好，呼叫端（live_view_controller.py／
+RTSP 還是 UVC。目前有兩個實作：
+    RTSPVideoSource       -- 透過網路 RTSP 取得畫面（保留作 debug / fallback）
+    FFmpegUVCVideoSource  -- 2026-10-12 新增，透過 USB UVC（Windows
+                             DirectShow）取得畫面，IQ Adjustment 預設使用
+要用哪一個由 DA005ControlPanel.pyw 決定，呼叫端（live_view_controller.py／
 screen_iq_adjustment.py）完全不用改。
 
 介面（VideoSource）：
@@ -246,31 +248,308 @@ def _read_exact_from_pipe(stream, num_bytes):
     return bytes(buffer)
 
 
-class UVCVideoSource(VideoSource):
-    """佔位用：之後 RD 提供 UVC 裝置存取方式後，把 start()/read_frame()/
-    stop()/is_running()/get_error() 填成真正呼叫 UVC 裝置（例如
-    cv2.VideoCapture(device_index) 或廠商 SDK）的邏輯即可——因為介面
-    (VideoSource) 完全一樣，live_view_controller.py 跟
-    screen_iq_adjustment.py 都不需要修改，只要把建立 VideoSource 的那一行
-    從 RTSPVideoSource(...) 換成 UVCVideoSource(device_index) 就好。
+# ==========================================
+# UVC（USB 影像）來源
+# ==========================================
+# 2026-10-12 新增。取代原本用 camera index + cv2 的 UVCVideoSource 佔位類別。
+#
+# 為什麼不用 cv2.VideoCapture：
+#   1. camera index 會隨裝置插拔順序改變，這裡改用 DirectShow 的「裝置名稱」
+#      指定，不會抓錯相機。
+#   2. 跟 RTSPVideoSource 用同一個專案自帶的 ffmpeg、同一套 pipe 讀取方式，
+#      兩種來源的行為一致、比較好維護。
+#
+# 實測（uvc_smoke_test.py，2026-10-12）：Dashcam 的 MJPEG 1920x1080@30 可以
+# 穩定 30fps；輸出給 Python 的畫面由 ffmpeg 先降成 1280x720@15——UI 本身每
+# 67ms（約 15fps）才更新一次，送完整 1920x1080@30 只會白白增加 pipe 流量。
+#
+# 2026-10-12 輸出尺寸比較（UI 繪製時間 / 畫質 PSNR）後，從 960x540 改成 1280x720：
+#   960x540   繪製約 20ms，視窗放大後明顯變糊
+#   1280x720  繪製約 24ms，畫質明顯較好，CPU 全機只多約 2%（目前使用）
+#   1920x1080 繪製約 33ms（吃掉 67ms tick 的一半），UI 有變卡風險
+#
+# 注意：這台測試 PC 上，用 python / pythonw 啟動時 Dashcam 可能完全不送畫面
+# （python -X utf8 正常），懷疑是 Kaspersky 網路攝影機保護攔截。這種情況
+# ffmpeg 會自己結束，這裡會回報錯誤，畫面顯示 Live View unavailable。
 
-    目前故意不實作內容（NotImplementedError），避免有人誤用一個看起來能動
-    但其實什麼都沒做的假 UVC 來源。"""
+DEFAULT_UVC_DEVICE_NAME = 'USB2 NCM'   # 裝置管理員 / DirectShow 裡 Dashcam 的名稱
 
-    def __init__(self, device_index=0):
-        self._device_index = device_index
+# Dashcam 端的輸入格式（實測過正常的組合，-vcodec mjpeg 是選 MJPEG 那個輸出格式）
+UVC_INPUT_WIDTH = 1920
+UVC_INPUT_HEIGHT = 1080
+UVC_INPUT_FPS = 30
+
+UVC_FIRST_FRAME_TIMEOUT_SECONDS = 10   # start() 後這麼多秒還沒收到第一張畫面，就算失敗
+UVC_STDERR_KEEP_LINES = 20             # ffmpeg 錯誤訊息只保留最近這麼多行，不會無限累積
+UVC_STOP_WAIT_SECONDS = 2              # stop 時等 ffmpeg 結束、等 thread 結束的秒數
+
+
+def _uvc_log(message):
+    """印出帶時間戳的 log，方便跟 ffmpeg / 系統 log 對時間。"""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    print(f'[{timestamp}][video_source][uvc] {message}')
+
+
+class FFmpegUVCVideoSource(VideoSource):
+    """UVC -> DirectShow -> ffmpeg subprocess -> rawvideo RGB24 pipe ->
+    背景 thread -> latest frame only。
+
+    對外介面跟 RTSPVideoSource 一樣（start/read_frame/stop/is_running/
+    get_error/get_frame_size），LiveViewController 不需要知道差別。
+    只支援 Windows（DirectShow）。"""
+
+    def __init__(self, device_name=DEFAULT_UVC_DEVICE_NAME, frame_width=1280, frame_height=720, fps=15):
+        self._device_name = device_name
+        self._frame_width = frame_width     # 輸出給 UI 的畫面寬
+        self._frame_height = frame_height   # 輸出給 UI 的畫面高
+        self._fps = fps                     # 輸出給 UI 的 fps
+
+        self._process = None
+        self._reader_thread = None
+        self._stderr_thread = None
+        self._stop_flag = None  # threading.Event()，每次 start() 都建立新的一個
+
+        self._frame_lock = threading.Lock()
+        self._latest_frame_bytes = None
+
+        self._stderr_lock = threading.Lock()
+        self._recent_stderr_lines = []
+
+        self._error_message = None
+        self._start_time = None
+        self._first_frame_seconds = None   # 從 start() 到收到第一張畫面花了幾秒
+        self._timeout_logged = False       # 第一張畫面逾時的 log 只印一次
+
+    def get_frame_size(self):
+        """回傳 (width, height)，呼叫端要用這個尺寸還原 read_frame() 的 bytes。"""
+        return self._frame_width, self._frame_height
+
+    def get_first_frame_seconds(self):
+        """回傳 start() 到第一張有效畫面的秒數，還沒收到畫面回傳 None（驗證/除錯用）。"""
+        return self._first_frame_seconds
+
+    # ---------- 啟動 ----------
+
+    def _build_command(self, ffmpeg_path):
+        """組出 ffmpeg 指令。輸入：Dashcam MJPEG 1920x1080@30；
+        輸出：先降 fps 再縮小（先降 fps 可以少縮放一半的畫面），rawvideo RGB24。"""
+        video_filter = f'fps={self._fps},scale={self._frame_width}:{self._frame_height}:flags=fast_bilinear'
+        return [
+            ffmpeg_path,
+            '-hide_banner',
+            '-nostats',                  # 不要每秒印進度，減少 stderr 輸出量
+            '-loglevel', 'error',        # 只印錯誤（MJPEG 每次都會有一行無害的 pixel format 警告，不印）
+            '-f', 'dshow',
+            '-rtbufsize', '64M',
+            '-vcodec', 'mjpeg',
+            '-video_size', f'{UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}',
+            '-framerate', str(UVC_INPUT_FPS),
+            '-i', f'video={self._device_name}',
+            '-vf', video_filter,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            'pipe:1',
+        ]
 
     def start(self):
-        raise NotImplementedError('UVCVideoSource 尚未實作，等 RD 提供 UVC 裝置存取方式後再補上')
+        if self._process is not None:
+            return  # 已經在跑，不重複啟動第二個 ffmpeg
+
+        # 清掉上一輪的狀態
+        self._error_message = None
+        self._start_time = time.time()
+        self._first_frame_seconds = None
+        self._timeout_logged = False
+        with self._frame_lock:
+            self._latest_frame_bytes = None
+        with self._stderr_lock:
+            self._recent_stderr_lines = []
+
+        ffmpeg_path = find_ffmpeg_executable()
+        if ffmpeg_path is None:
+            self._error_message = '找不到可用的 ffmpeg'
+            _uvc_log(self._error_message)
+            return
+
+        command = self._build_command(ffmpeg_path)
+        _uvc_log(f'啟動 ffmpeg：裝置="{self._device_name}"，輸入 {UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}@{UVC_INPUT_FPS} '
+                 f'MJPEG，輸出 {self._frame_width}x{self._frame_height}@{self._fps} RGB24，ffmpeg={ffmpeg_path}')
+
+        self._stop_flag = threading.Event()
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,     # ffmpeg 不需要輸入，避免它等鍵盤輸入
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except OSError as error:
+            self._process = None
+            self._error_message = f'啟動 ffmpeg 失敗: {error}'
+            _uvc_log(self._error_message)
+            return
+
+        _uvc_log(f'ffmpeg 已啟動，pid={self._process.pid}')
+
+        # 把這一輪的 process / stop_flag 傳給 thread，
+        # 這樣舊的 thread 只會看自己那一輪的東西，不會影響 reopen 後的新一輪
+        process = self._process
+        stop_flag = self._stop_flag
+
+        # stderr 一定要有人一直讀，不然 pipe 滿了 ffmpeg 會卡住
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, args=(process,), daemon=True)
+        self._stderr_thread.start()
+
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(process, stop_flag, self._stderr_thread), daemon=True,
+        )
+        self._reader_thread.start()
+
+    # ---------- 背景 thread ----------
+
+    def _stderr_loop(self, process):
+        """持續讀 ffmpeg 的 stderr：印到 log，並只保留最近幾行給錯誤訊息用。"""
+        try:
+            for line in iter(process.stderr.readline, b''):
+                text = line.decode('utf-8', errors='ignore').strip()
+                if not text:
+                    continue
+                _uvc_log(f'ffmpeg: {text}')
+                with self._stderr_lock:
+                    self._recent_stderr_lines.append(text)
+                    if len(self._recent_stderr_lines) > UVC_STDERR_KEEP_LINES:
+                        self._recent_stderr_lines.pop(0)
+        except (OSError, ValueError):
+            pass  # stop() 關掉 pipe 時會走到這裡，屬於正常結束
+
+    def _reader_loop(self, process, stop_flag, stderr_thread):
+        """持續從 stdout 讀完整的一張畫面，只保留最新一張。"""
+        frame_byte_size = self._frame_width * self._frame_height * 3  # RGB24：每個像素 3 bytes
+        try:
+            while not stop_flag.is_set():
+                frame_bytes = _read_exact_from_pipe(process.stdout, frame_byte_size)
+                if frame_bytes is None:
+                    break  # EOF：ffmpeg 結束了（不完整的最後一張直接丟掉）
+                with self._frame_lock:
+                    self._latest_frame_bytes = frame_bytes
+                if self._first_frame_seconds is None:
+                    self._first_frame_seconds = time.time() - self._start_time
+                    _uvc_log(f'收到第一張畫面，耗時 {self._first_frame_seconds:.2f} 秒')
+        except (OSError, ValueError) as error:
+            if not stop_flag.is_set():
+                self._error_message = f'讀取 UVC 畫面時發生例外: {error}'
+
+        if stop_flag.is_set():
+            return  # 使用者主動 stop，不算錯誤
+
+        # 不是使用者停止，卻讀不到畫面：ffmpeg 異常結束（找不到裝置、USB 拔除、被 kill...）
+        # 等 ffmpeg 真的結束、stderr 最後幾行讀完，錯誤訊息才會完整
+        exit_code = None
+        try:
+            exit_code = process.wait(timeout=UVC_STOP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        stderr_thread.join(timeout=1)
+
+        # 上面等待的這段時間，使用者可能已經按了 Retry（stop 再 start），
+        # 這時候不能把舊一輪的錯誤寫到新一輪
+        if stop_flag.is_set():
+            return
+        if not self._error_message:
+            last_line = self._get_last_stderr_line()
+            self._error_message = f'UVC 影像中斷（ffmpeg 結束，exit code={exit_code}）：{last_line}'
+        _uvc_log(self._error_message)
+
+    def _get_last_stderr_line(self):
+        with self._stderr_lock:
+            if self._recent_stderr_lines:
+                return self._recent_stderr_lines[-1]
+        return '沒有錯誤訊息'
+
+    # ---------- 對外介面 ----------
 
     def read_frame(self):
-        return None
+        with self._frame_lock:
+            frame_bytes = self._latest_frame_bytes
+        if frame_bytes is None:
+            return None
+        return self._frame_width, self._frame_height, frame_bytes
 
     def stop(self):
-        pass
+        """停止順序：terminate -> 等結束 -> 逾時就 kill -> 等結束 -> join thread
+        -> 關 pipe -> 清畫面。一定要等 ffmpeg 真的結束（攝影機才會釋放），
+        之後 reopen 才不會開不起來。可以安全重複呼叫。"""
+        if self._process is None:
+            return
+
+        if self._stop_flag is not None:
+            self._stop_flag.set()
+
+        process = self._process
+        self._process = None
+        stop_begin = time.time()
+
+        _stop_process(process)
+
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=UVC_STOP_WAIT_SECONDS)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=UVC_STOP_WAIT_SECONDS)
+        self._reader_thread = None
+        self._stderr_thread = None
+
+        _close_pipe(process.stdout)
+        _close_pipe(process.stderr)
+
+        with self._frame_lock:
+            self._latest_frame_bytes = None
+
+        _uvc_log(f'已停止，pid={process.pid}，exit code={process.poll()}，耗時 {time.time() - stop_begin:.2f} 秒')
 
     def is_running(self):
-        return False
+        return self._process is not None
 
     def get_error(self):
-        return 'UVC not implemented yet'
+        if self._error_message:
+            return self._error_message
+
+        # 第一張畫面逾時：ffmpeg 還活著，但一直沒有送出畫面
+        if self._process is not None and self._first_frame_seconds is None and self._start_time is not None:
+            if time.time() - self._start_time > UVC_FIRST_FRAME_TIMEOUT_SECONDS:
+                message = f'{UVC_FIRST_FRAME_TIMEOUT_SECONDS} 秒內沒有收到 UVC 畫面（裝置="{self._device_name}"）'
+                if not self._timeout_logged:
+                    _uvc_log(f'{message}，ffmpeg 最後訊息：{self._get_last_stderr_line()}')
+                    self._timeout_logged = True
+                return message
+
+        return None
+
+
+def _stop_process(process):
+    """terminate -> wait(2s) -> 逾時就 kill -> wait。確認 process 真的結束。"""
+    try:
+        process.terminate()
+        process.wait(timeout=UVC_STOP_WAIT_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        _uvc_log(f'ffmpeg 在 {UVC_STOP_WAIT_SECONDS} 秒內沒有結束，改用 kill，pid={process.pid}')
+    except OSError:
+        pass  # process 已經自己結束了
+
+    try:
+        process.kill()
+        process.wait(timeout=UVC_STOP_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _uvc_log(f'警告：kill 之後 ffmpeg 仍未結束，pid={process.pid}，攝影機可能還沒釋放')
+    except OSError:
+        pass
+
+
+def _close_pipe(pipe):
+    if pipe is None:
+        return
+    try:
+        pipe.close()
+    except OSError:
+        pass

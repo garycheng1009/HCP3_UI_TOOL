@@ -20,3 +20,6 @@ runtime/ffmpeg/
 # 沒有實際用途
 .DS_Store
 ._*
+
+# uvc_smoke_test.py 每次執行產生的截圖/結果，只是本機驗證用
+uvc_smoke_output/

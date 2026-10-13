@@ -89,8 +89,12 @@ ENTRY_CHAR_WIDTH = 7  # tk.Entry 的 width 是字元數不是 px；量測過 Cal
 # ROW_COLOR（#3d3d45）有明顯對比、一眼看得出是主要動作，但不會像原本
 # 那麼刺眼。只有這顆 Apply 按鈕用這組顏色，不影響 ACCENT_COLOR 原本在
 # Favorite/Checkbox 上的用法。
-APPLY_BUTTON_BG_COLOR = '#B99A4E'
-APPLY_BUTTON_HOVER_COLOR = '#A5872F'
+# 2026-10-06 使用者回饋 #B99A4E 在深色 UI 中還是偏亮、偏黃，再降低飽和度
+# （約 43% -> 27%）、稍微調暗，改成卡其金：跟卡片背景 ROW_COLOR 對比約
+# 3.1:1，仍然看得出是主要動作；深色字 APPLY_BUTTON_TEXT_COLOR 在上面的
+# 對比約 4.7:1，清楚可讀。Hover 沿用「變暗一階」的做法。
+APPLY_BUTTON_BG_COLOR = '#9C8A5A'
+APPLY_BUTTON_HOVER_COLOR = '#88784C'
 APPLY_BUTTON_TEXT_COLOR = '#1f1f1f'
 
 # (payload_key, 顯示文字, 最小值, 最大值)
@@ -415,7 +419,7 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
     回 Settings 的函式，這裡不自己判斷）。
     live_view_controller：live_view_controller.LiveViewController 的實例
     （由 DA005ControlPanel.pyw 建構、決定裡面包的是 RTSPVideoSource 還是
-    以後的 UVCVideoSource），這支檔案只透過它的 start_live_view()/
+    FFmpegUVCVideoSource），這支檔案只透過它的 start_live_view()/
     stop_live_view()/retry_live_view()/get_status()/get_latest_frame()
     操作，完全不知道實際的影像來源是什麼。傳 None 的話 Live View 區域
     只會顯示，不會嘗試啟動任何東西（呼叫 start_live_view() 之類的公開
@@ -521,7 +525,7 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
     # ---- [Control]：Restore Defaults / Apply ----
     # 2026-09-24 使用者要求：Apply 是主要動作，視覺上要比 Restore Defaults
     # 更明顯，但原本用 screen_gallery.ACCENT_COLOR（亮黃色）太刺眼，改用
-    # APPLY_BUTTON_BG_COLOR 這組柔和金銅色（見檔案開頭常數說明）。
+    # APPLY_BUTTON_BG_COLOR 這組低飽和的卡其金（見檔案開頭常數說明）。
     # Restore Defaults 維持原本的次要按鈕樣式不變。兩顆按鈕字型/pady 都
     # 來自同一個 style_dark_button()，高度自然一致，只有 padx（寬度）跟
     # 顏色不同——這一輪只換顏色，不動排版/間距。
@@ -552,8 +556,9 @@ def build_screen(parent, on_apply_iq=None, on_back=None, live_view_controller=No
 
     # ---- 右側：Live View Preview。2026-09-24 使用者要求改成 demo 風格：
     # 不顯示「Live View Preview」標題、不顯示「Connected - RTSP」這種
-    # 工程來源文字——正常/連線中都不顯示任何文字，只有畫面本身；只有連線
-    # 失敗時才在黑底中央顯示一句簡短訊息（不含 RTSP/UVC/exception 細節）。
+    # 工程來源文字——正常顯示時只有畫面本身；連線中（還沒拿到第一張畫面）
+    # 在黑底中央顯示「Starting Live View...」，連線失敗顯示「Live View
+    # unavailable」（都不含 RTSP/UVC/exception 細節），見 _live_view_tick()。
     # 這支檔案完全不知道畫面來源是 RTSP 還是 UVC——只透過
     # _live_view_controller（build_screen() 傳進來的
     # live_view_controller.LiveViewController 實例）操作，見檔案開頭說明。
@@ -784,7 +789,7 @@ def start_live_view():
         return  # 已經在跑（tick 迴圈還在排），不要重複啟動
     _live_view_active = True
     live_view_retry_button.place_forget()
-    live_view_canvas.delete('all')  # 連線中不顯示任何文字，見檔案開頭 2026-09-24 說明
+    live_view_canvas.delete('all')  # 清掉上一次的畫面；下面的 _live_view_tick() 會立刻畫上「Starting Live View...」
     _live_view_controller.start_live_view()
     _live_view_tick()
 
@@ -810,7 +815,9 @@ def on_retry_live_view_click():
     if _live_view_controller is None:
         return
     live_view_retry_button.place_forget()
-    live_view_canvas.delete('all')  # 連線中不顯示任何文字，見檔案開頭 2026-09-24 說明
+    # 重新連線期間跟第一次進頁面一樣顯示「Starting Live View...」，
+    # 不要留一片黑畫面（下一次 _live_view_tick() 也會持續畫這行字，直到拿到第一張畫面）
+    _render_live_view_message('Starting Live View...')
     _live_view_controller.retry_live_view()
     if not _live_view_active:
         # 正常情況下使用者會看到 Retry 按鈕，代表頁面還開著、_live_view_active
@@ -823,11 +830,19 @@ def _live_view_tick():
     """main thread 定期執行：跟 live_view_controller 要一次最新狀態/畫面，
     只顯示「目前拿到的這個狀態」，不會因為跟不上就累積或卡住。
 
-    2026-09-24 使用者要求改成 demo 風格：connected/connecting 兩種狀態都
-    不顯示任何文字（只有畫面，或連線中的空黑畫面）——不再顯示
-    「Connected - RTSP」這種來源技術資訊。只有 error 狀態才在畫面中央顯示
-    一句簡短、不含 RTSP/UVC/exception 細節的訊息（error_message 完全不會
-    被顯示出來，只是這裡不用它，不是被刻意忽略而遺漏處理）。"""
+    2026-09-24 使用者要求改成 demo 風格：connected 狀態不顯示任何文字
+    （只有畫面）——不再顯示「Connected - RTSP」這種來源技術資訊。error
+    狀態在畫面中央顯示一句簡短、不含 RTSP/UVC/exception 細節的訊息
+    （error_message 完全不會被顯示出來，只是這裡不用它，不是被刻意忽略
+    而遺漏處理）。
+
+    2026-10-06 使用者回報：連線中只有一整片黑色，看起來像功能沒反應或壞掉。
+    connecting/idle 狀態改成在畫面中央顯示「Starting Live View...」。
+    什麼時候拿掉這行字不靠固定 delay：LiveViewController 要等 VideoSource
+    真的讀到第一張畫面才會回報 connected（見 get_status()），而且這行字
+    是在 _render_live_view_frame() 真的把畫面畫上去的那一刻才被清掉，
+    所以一定是「看到影像」取代「Starting Live View...」，中間不會先閃一下
+    空黑畫面。"""
     if not _live_view_active or _live_view_controller is None:
         return
 
@@ -841,10 +856,9 @@ def _live_view_tick():
     elif status == live_view_controller_module.STATUS_ERROR:
         _render_live_view_message('Live View unavailable')
         live_view_retry_button.place(relx=0.5, rely=0.62, anchor='n')
-    else:  # connecting / idle
+    else:  # connecting / idle：還沒拿到第一張畫面
         live_view_retry_button.place_forget()
-        live_view_canvas.delete('live_view_frame')
-        live_view_canvas.delete('live_view_message')
+        _render_live_view_message('Starting Live View...')
 
     live_view_canvas.after(LIVE_VIEW_TICK_INTERVAL_MS, _live_view_tick)
 
@@ -874,8 +888,8 @@ def _render_live_view_frame(width, height, frame_bytes):
 
 
 def _render_live_view_message(text):
-    """在 live_view_canvas 正中央畫一句簡短文字（目前只有連線失敗時會
-    呼叫），不使用另外的常駐 Label——這樣訊息永遠是「疊在黑色預覽區中
+    """在 live_view_canvas 正中央畫一句簡短文字（連線中的「Starting Live
+    View...」、連線失敗的「Live View unavailable」），不使用另外的常駐 Label——這樣訊息永遠是「疊在黑色預覽區中
     央」，不管 Canvas 目前多大都一樣置中，跟 _render_live_view_frame() 的
     置中邏輯一致。Canvas 還沒有真正尺寸時直接跳過，理由同
     _render_live_view_frame()。"""
