@@ -1541,8 +1541,16 @@ def report_gallery_item_count_from_recordings(recordings):
     # 成「沒有變化」而跳過——見該旗標宣告處的完整說明。
     _current_groups_changed_without_render = True
 
+    # 2026-10-06 修正：原本這裡只回報 Gallery 數量、沒有回報 Favorite 數量，
+    # 導致 App 啟動時（Recording 頁面刷新走的就是這條路徑）Favorite Tab 不會
+    # 出現，要等使用者點一次 Gallery、Gallery 自己完整 refresh 完
+    # （on_recordings_loaded() 最後的 notify_favorite_state_changed()）才會
+    # 顯示。current_groups 上面已經用剛 GET 到的資料更新好了，這裡直接用
+    # 同一份資料回報 Favorite 數量。順序跟 on_recordings_loaded() 一致：
+    # 先回報 Gallery、再回報 Favorite（理由見該處說明）。
     if on_gallery_item_count_changed_callback:
         on_gallery_item_count_changed_callback(len(current_groups))
+    notify_favorite_state_changed()
 
 
 def prune_stale_thumbnail_cache(groups):
