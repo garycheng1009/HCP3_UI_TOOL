@@ -5,8 +5,9 @@ video_source.py — 可替換的 Live View 影像來源（VideoSource abstractio
 呼叫一個共同介面（VideoSource）取得 Live View 畫面，不用知道背後實際上是
 RTSP 還是 UVC。目前有兩個實作：
     RTSPVideoSource       -- 透過網路 RTSP 取得畫面（保留作 debug / fallback）
-    FFmpegUVCVideoSource  -- 2026-10-12 新增，透過 USB UVC（Windows
-                             DirectShow）取得畫面，IQ Adjustment 預設使用
+    FFmpegUVCVideoSource  -- 2026-10-12 新增，透過 USB UVC 取得畫面（Windows
+                             DirectShow / 2026-10-13 起 macOS AVFoundation），
+                             首頁與 IQ Adjustment 預設使用
 要用哪一個由 DA005ControlPanel.pyw 決定，呼叫端（live_view_controller.py／
 screen_iq_adjustment.py）完全不用改。
 
@@ -38,6 +39,7 @@ Live View 已經用同一套做法驗證過可以動，這裡延用同一個經�
 """
 
 import subprocess
+import sys
 import threading
 import time
 
@@ -271,13 +273,24 @@ def _read_exact_from_pipe(stream, num_bytes):
 # 注意：這台測試 PC 上，用 python / pythonw 啟動時 Dashcam 可能完全不送畫面
 # （python -X utf8 正常），懷疑是 Kaspersky 網路攝影機保護攔截。這種情況
 # ffmpeg 會自己結束，這裡會回報錯誤，畫面顯示 Live View unavailable。
+#
+# 2026-10-13 新增 macOS（AVFoundation）支援，實測（mac_uvc_check.py）：
+#   - AVFoundation 裝置列表裡 Dashcam 的名稱一樣是 "USB2 NCM"，但 index 會變
+#     （同一台 Mac 兩次測試分別是 [1]、[0]），所以一律用名稱開啟，不用 index。
+#   - AVFoundation 不能指定「拿 MJPEG」，macOS 會先解碼好再給 ffmpeg，
+#     uyvy422 1920x1080 實測約 28.5fps；輸出一樣降成 1280x720@15 rgb24。
+#   - 第一張畫面約 0.35~0.39 秒，連續 open / stop / reopen 正常。
+#   - stop 的注意事項見 stop() 跟 _reader_loop() 的說明（停止時要繼續讀 stdout）。
+#   - 需要 macOS 相機權限：開發時是 Terminal（或 VS Code 等啟動 python 的 App），
+#     打包後是 .app 本身（Control_Panel_mac.spec 的 NSCameraUsageDescription）。
 
-DEFAULT_UVC_DEVICE_NAME = 'USB2 NCM'   # 裝置管理員 / DirectShow 裡 Dashcam 的名稱
+DEFAULT_UVC_DEVICE_NAME = 'USB2 NCM'   # Dashcam 的 UVC 裝置名稱（Windows DirectShow / macOS AVFoundation 都一樣）
 
-# Dashcam 端的輸入格式（實測過正常的組合，-vcodec mjpeg 是選 MJPEG 那個輸出格式）
+# Dashcam 端的輸入格式（實測過正常的組合）
 UVC_INPUT_WIDTH = 1920
 UVC_INPUT_HEIGHT = 1080
 UVC_INPUT_FPS = 30
+UVC_MAC_PIXEL_FORMAT = 'uyvy422'       # macOS AVFoundation 實測可用的像素格式
 
 UVC_FIRST_FRAME_TIMEOUT_SECONDS = 10   # start() 後這麼多秒還沒收到第一張畫面，就算失敗
 UVC_STDERR_KEEP_LINES = 20             # ffmpeg 錯誤訊息只保留最近這麼多行，不會無限累積
@@ -291,12 +304,13 @@ def _uvc_log(message):
 
 
 class FFmpegUVCVideoSource(VideoSource):
-    """UVC -> DirectShow -> ffmpeg subprocess -> rawvideo RGB24 pipe ->
-    背景 thread -> latest frame only。
+    """UVC -> DirectShow（Windows）/ AVFoundation（macOS）-> ffmpeg subprocess
+    -> rawvideo RGB24 pipe -> 背景 thread -> latest frame only。
 
     對外介面跟 RTSPVideoSource 一樣（start/read_frame/stop/is_running/
     get_error/get_frame_size），LiveViewController 不需要知道差別。
-    只支援 Windows（DirectShow）。"""
+    兩個平台共用同一個類別，只有 ffmpeg 的輸入參數不同（見 _build_input_args()）。
+    其他平台（例如 Linux）不支援，start() 會直接回報錯誤。"""
 
     def __init__(self, device_name=DEFAULT_UVC_DEVICE_NAME, frame_width=1280, frame_height=720, fps=15):
         self._device_name = device_name
@@ -330,26 +344,48 @@ class FFmpegUVCVideoSource(VideoSource):
 
     # ---------- 啟動 ----------
 
-    def _build_command(self, ffmpeg_path):
-        """組出 ffmpeg 指令。輸入：Dashcam MJPEG 1920x1080@30；
+    def _build_input_args(self):
+        """依平台組出 ffmpeg 的輸入參數（兩個平台都用裝置名稱，不用 index）。
+        回傳 None 表示目前平台不支援 UVC。"""
+        if sys.platform == 'win32':
+            # Windows DirectShow：-vcodec mjpeg 是選 Dashcam 的 MJPEG 輸出格式
+            return [
+                '-f', 'dshow',
+                '-rtbufsize', '64M',
+                '-vcodec', 'mjpeg',
+                '-video_size', f'{UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}',
+                '-framerate', str(UVC_INPUT_FPS),
+                '-i', f'video={self._device_name}',
+            ]
+        if sys.platform == 'darwin':
+            # macOS AVFoundation：-i "名稱:none" = 只要影像、不要聲音（不需要麥克風權限）
+            return [
+                '-f', 'avfoundation',
+                '-framerate', str(UVC_INPUT_FPS),
+                '-video_size', f'{UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}',
+                '-pixel_format', UVC_MAC_PIXEL_FORMAT,
+                '-i', f'{self._device_name}:none',
+            ]
+        return None
+
+    def _build_command(self, ffmpeg_path, input_args):
+        """組出 ffmpeg 指令。輸入：Dashcam 1920x1080@30（參數見 _build_input_args()）；
         輸出：先降 fps 再縮小（先降 fps 可以少縮放一半的畫面），rawvideo RGB24。"""
         video_filter = f'fps={self._fps},scale={self._frame_width}:{self._frame_height}:flags=fast_bilinear'
-        return [
+        command = [
             ffmpeg_path,
             '-hide_banner',
             '-nostats',                  # 不要每秒印進度，減少 stderr 輸出量
             '-loglevel', 'error',        # 只印錯誤（MJPEG 每次都會有一行無害的 pixel format 警告，不印）
-            '-f', 'dshow',
-            '-rtbufsize', '64M',
-            '-vcodec', 'mjpeg',
-            '-video_size', f'{UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}',
-            '-framerate', str(UVC_INPUT_FPS),
-            '-i', f'video={self._device_name}',
+        ]
+        command += input_args
+        command += [
             '-vf', video_filter,
             '-f', 'rawvideo',
             '-pix_fmt', 'rgb24',
             'pipe:1',
         ]
+        return command
 
     def start(self):
         if self._process is not None:
@@ -371,9 +407,16 @@ class FFmpegUVCVideoSource(VideoSource):
             _uvc_log(self._error_message)
             return
 
-        command = self._build_command(ffmpeg_path)
-        _uvc_log(f'啟動 ffmpeg：裝置="{self._device_name}"，輸入 {UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}@{UVC_INPUT_FPS} '
-                 f'MJPEG，輸出 {self._frame_width}x{self._frame_height}@{self._fps} RGB24，ffmpeg={ffmpeg_path}')
+        input_args = self._build_input_args()
+        if input_args is None:
+            self._error_message = f'這個平台（{sys.platform}）不支援 UVC，請改用 DA005_LIVE_VIEW_SOURCE=rtsp'
+            _uvc_log(self._error_message)
+            return
+
+        command = self._build_command(ffmpeg_path, input_args)
+        input_format = input_args[1]   # 'dshow' 或 'avfoundation'
+        _uvc_log(f'啟動 ffmpeg（{input_format}）：裝置="{self._device_name}"，輸入 {UVC_INPUT_WIDTH}x{UVC_INPUT_HEIGHT}@{UVC_INPUT_FPS}，'
+                 f'輸出 {self._frame_width}x{self._frame_height}@{self._fps} RGB24，ffmpeg={ffmpeg_path}')
 
         self._stop_flag = threading.Event()
         try:
@@ -424,13 +467,22 @@ class FFmpegUVCVideoSource(VideoSource):
             pass  # stop() 關掉 pipe 時會走到這裡，屬於正常結束
 
     def _reader_loop(self, process, stop_flag, stderr_thread):
-        """持續從 stdout 讀完整的一張畫面，只保留最新一張。"""
+        """持續從 stdout 讀完整的一張畫面，只保留最新一張。
+
+        2026-10-13：一定要讀到 EOF 才結束，stop 之後也繼續讀（只是畫面丟掉）。
+        macOS 上 terminate() 是送 SIGTERM，ffmpeg 收到後只是設一個「要結束」的
+        旗標，要回到主迴圈才會真的結束；如果這時候沒人讀 stdout，ffmpeg 會卡在
+        寫 pipe（一張 rgb24 畫面約 2.7MB，pipe 緩衝只有約 64KB），永遠回不到主
+        迴圈，只能等 timeout 後被 kill。實測一邊讀一邊送 SIGTERM，約 0.07 秒就
+        正常結束。Windows 的 terminate() 是直接強制結束，讀到 EOF 的行為一樣。"""
         frame_byte_size = self._frame_width * self._frame_height * 3  # RGB24：每個像素 3 bytes
         try:
-            while not stop_flag.is_set():
+            while True:
                 frame_bytes = _read_exact_from_pipe(process.stdout, frame_byte_size)
                 if frame_bytes is None:
                     break  # EOF：ffmpeg 結束了（不完整的最後一張直接丟掉）
+                if stop_flag.is_set():
+                    continue  # 正在停止：繼續讀 stdout 讓 ffmpeg 能正常結束，畫面丟掉
                 with self._frame_lock:
                     self._latest_frame_bytes = frame_bytes
                 if self._first_frame_seconds is None:
@@ -459,7 +511,18 @@ class FFmpegUVCVideoSource(VideoSource):
         if not self._error_message:
             last_line = self._get_last_stderr_line()
             self._error_message = f'UVC 影像中斷（ffmpeg 結束，exit code={exit_code}）：{last_line}'
+            if sys.platform == 'darwin' and self._is_camera_permission_error():
+                self._error_message += '（macOS 相機權限被拒：系統設定 > 隱私權與安全性 > 相機，允許這個 App / Terminal 後重新啟動）'
         _uvc_log(self._error_message)
+
+    def _is_camera_permission_error(self):
+        """ffmpeg 最近的 stderr 看起來像不像 macOS 相機權限被拒"""
+        with self._stderr_lock:
+            recent_text = ' '.join(self._recent_stderr_lines).lower()
+        for keyword in ('not authorized', 'denied', 'permission'):
+            if keyword in recent_text:
+                return True
+        return False
 
     def _get_last_stderr_line(self):
         with self._stderr_lock:
@@ -477,9 +540,11 @@ class FFmpegUVCVideoSource(VideoSource):
         return self._frame_width, self._frame_height, frame_bytes
 
     def stop(self):
-        """停止順序：terminate -> 等結束 -> 逾時就 kill -> 等結束 -> join thread
-        -> 關 pipe -> 清畫面。一定要等 ffmpeg 真的結束（攝影機才會釋放），
-        之後 reopen 才不會開不起來。可以安全重複呼叫。"""
+        """停止順序：設 stop flag -> terminate（macOS 是 SIGTERM，讓 ffmpeg 正常
+        收尾；這段期間 reader thread 會繼續把 stdout 讀完，見 _reader_loop()）
+        -> 等結束 -> 逾時才 kill -> 等結束 -> join thread -> 關 pipe -> 清畫面。
+        一定要等 ffmpeg 真的結束（攝影機才會釋放），之後 reopen 才不會開不起來。
+        可以安全重複呼叫。"""
         if self._process is None:
             return
 
@@ -527,7 +592,9 @@ class FFmpegUVCVideoSource(VideoSource):
 
 
 def _stop_process(process):
-    """terminate -> wait(2s) -> 逾時就 kill -> wait。確認 process 真的結束。"""
+    """terminate -> wait(2s) -> 逾時就 kill -> wait。確認 process 真的結束。
+    terminate() 在 Windows 是直接強制結束；macOS 是 SIGTERM（ffmpeg 會正常收尾，
+    前提是 reader thread 還在讀 stdout），kill 只是逾時的最後手段。"""
     try:
         process.terminate()
         process.wait(timeout=UVC_STOP_WAIT_SECONDS)

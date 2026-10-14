@@ -23,3 +23,6 @@ runtime/ffmpeg/
 
 # uvc_smoke_test.py 每次執行產生的截圖/結果，只是本機驗證用
 uvc_smoke_output/
+
+# mac_uvc_check.py 每次執行產生的 log / 截圖，只是 Mac 本機驗證用
+mac_uvc_output/

@@ -1241,8 +1241,12 @@ register_screen('race_track', screen_race_track.build_screen(
 # 2026-10-12 改成預設用 UVC（FFmpegUVCVideoSource）。RTSP 保留作 debug /
 # fallback，但「不會」在 UVC 失敗時自動切換（避免把 UVC 的問題藏起來），
 # 要用 RTSP 時手動設定環境變數再啟動：
-#     set DA005_LIVE_VIEW_SOURCE=rtsp
-# UVC 用的是 Windows DirectShow，macOS 一律用 RTSP。
+#     set DA005_LIVE_VIEW_SOURCE=rtsp          （Windows cmd）
+#     DA005_LIVE_VIEW_SOURCE=rtsp python3 ...  （macOS Terminal）
+#
+# 2026-10-13：macOS 也改成預設 UVC（FFmpegUVCVideoSource 內部改用
+# AVFoundation，見 video_source.py）。只有 Windows / macOS 支援 UVC，
+# 其他平台（例如 Linux）沒有 UVC 實作，固定用 RTSP。
 #
 # 2026-10-13 改成整個 App 只建立「一個」LiveViewController（裡面只有一個
 # VideoSource），首頁（owner='home'）跟 IQ Adjustment（owner=
@@ -1254,7 +1258,7 @@ LIVE_VIEW_SOURCE_ENV_NAME = 'DA005_LIVE_VIEW_SOURCE'
 
 def create_shared_live_view_controller():
     source_name = os.environ.get(LIVE_VIEW_SOURCE_ENV_NAME, 'uvc').strip().lower()
-    if sys.platform != 'win32':
+    if sys.platform not in ('win32', 'darwin'):
         source_name = 'rtsp'
 
     if source_name == 'rtsp':

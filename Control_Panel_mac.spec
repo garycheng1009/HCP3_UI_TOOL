@@ -124,4 +124,14 @@ app = BUNDLE(
     name='Dashcam_Control_Panel_mac_v2.0.app',
     icon=None,
     bundle_identifier='com.dashcam.controlpanel',
+    # 2026-10-13 macOS Live View 改用 UVC（ffmpeg AVFoundation 讀 Dashcam 的
+    # "USB2 NCM" 攝影機）。ffmpeg 是這個 .app 的子行程，macOS 會用 .app
+    # 本身的身分詢問相機權限；Info.plist 沒有 NSCameraUsageDescription 的話
+    # 系統會直接拒絕存取（甚至把 App 關掉）。只讀影像不讀聲音（-i "名稱:none"），
+    # 不需要 NSMicrophoneUsageDescription。
+    # 目前沒有 codesign；以後如果改成簽章 + Hardened Runtime，還要另外加
+    # com.apple.security.device.camera entitlement。
+    info_plist={
+        'NSCameraUsageDescription': 'Dashcam Control Panel uses the camera to show the dashcam Live View over USB (UVC).',
+    },
  )
