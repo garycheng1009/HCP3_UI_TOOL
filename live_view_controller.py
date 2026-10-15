@@ -31,7 +31,14 @@ FFmpegUVCVideoSource 進來，這支檔案不用改一行。
 timeout（最多好幾秒）。所以這裡開一條背景 worker thread 專門做
 start/stop，UI 只是「登記想要的狀態」（_wanted_owner）然後馬上返回，
 worker 再照順序把實際狀態調整成想要的狀態。使用者快速來回切頁時，
-中間沒來得及做的 start/stop 會直接合併掉，不會一個一個排隊執行。"""
+中間沒來得及做的 start/stop 會直接合併掉，不會一個一個排隊執行。
+
+2026-10-14 新增 suspend()/resume()（快速拔插 Dashcam 後 Live View 卡住）：
+Dashcam 斷線（DISCONNECTED）跟恢復中（RECOVERING）由全域連線 watcher
+呼叫 suspend()——停掉 stream、清掉 owner、之後的 start/retry 一律忽略，
+get_status() 回傳 STATUS_UNAVAILABLE。回到 CONNECTED 才 resume()，resume
+不會自動重開 Live View，使用者要自己再開一次。Home／IQ 不用各自處理
+reconnect，只要看 get_status() 就好。"""
 
 import threading
 
@@ -39,6 +46,7 @@ STATUS_IDLE = 'idle'
 STATUS_CONNECTING = 'connecting'
 STATUS_CONNECTED = 'connected'
 STATUS_ERROR = 'error'
+STATUS_UNAVAILABLE = 'unavailable'  # Dashcam 斷線／恢復中，controller 被 suspend
 
 FORCE_STOP_WAIT_SECONDS = 10  # App 關閉時最多等 worker 手上正在做的 start/stop 這麼久
 
@@ -70,7 +78,8 @@ class LiveViewController:
 
         # worker 做 start/stop 時要拿這把鎖；force_stop() 也要拿，確保兩邊不會同時操作 VideoSource
         self._operation_lock = threading.Lock()
-        self._closed = False                  # force_stop() 之後就不再接受 start
+        self._closed = False                  # force_stop() 之後就不再接受 start（永久，App 關閉用）
+        self._suspended = False               # suspend() 之後暫時不接受 start，resume() 解除（斷線用）
 
         self._wake_event = threading.Event()  # UI 改了想要的狀態後 set()，叫醒 worker
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -86,6 +95,9 @@ class LiveViewController:
         - 原本沒人用，或是別的 owner 在用：worker 會先停掉舊的，再重新啟動"""
         with self._state_lock:
             if self._closed:
+                return
+            if self._suspended:
+                print(f'[live_view_controller] start 忽略：owner={owner}，Dashcam 斷線或恢復中（suspended）')
                 return
             if self._wanted_owner == owner:
                 return
@@ -114,12 +126,44 @@ class LiveViewController:
         with self._state_lock:
             if self._closed:
                 return
+            if self._suspended:
+                print(f'[live_view_controller] retry 忽略：owner={owner}，Dashcam 斷線或恢復中（suspended）')
+                return
             print(f'[live_view_controller] retry 要求：owner={owner}')
             self._wanted_owner = owner
             self._restart_requested = True
             self._has_received_frame = False
             self._start_exception_message = None
         self._wake_event.set()
+
+    def suspend(self):
+        """Dashcam 斷線時呼叫（全域連線 watcher）：不管 owner 是誰都停掉
+        stream、清掉 owner，之後 start/retry 一律忽略，直到 resume()。
+        stop 本身交給 worker 在背景做，不會卡 UI。可以安全重複呼叫。"""
+        with self._state_lock:
+            if self._closed:
+                return
+            print(f'[live_view_controller] suspend：停止 Live View（原 owner={self._wanted_owner}），'
+                  f'恢復前不接受 start')
+            self._suspended = True
+            self._wanted_owner = None
+            self._restart_requested = False
+            self._has_received_frame = False
+            self._start_exception_message = None
+        self._wake_event.set()
+
+    def resume(self):
+        """Dashcam 回到 CONNECTED 時呼叫：只是允許之後的 start，不會自動
+        重開 Live View（使用者要自己再開一次）。"""
+        with self._state_lock:
+            if not self._suspended:
+                return
+            print('[live_view_controller] resume：允許重新開啟 Live View（不自動重開）')
+            self._suspended = False
+
+    def is_suspended(self):
+        with self._state_lock:
+            return self._suspended
 
     def force_stop(self):
         """App 關閉時呼叫：不管 owner 是誰都停掉，而且會等到真的停完才返回
@@ -165,6 +209,7 @@ class LiveViewController:
           RTSP" 這種文字用）
 
         判斷順序：
+        0. 被 suspend（Dashcam 斷線／恢復中）-> unavailable
         1. Live View 不是這個 owner 要的 -> idle
         2. worker 還在處理（停舊的 / 啟動新的）-> connecting
         3. VideoSource.start() 直接丟例外，或 VideoSource 回報錯誤 -> error
@@ -173,6 +218,8 @@ class LiveViewController:
            剛好還沒有新畫面，也不會跳回 connecting，畫面不會閃爍）
         5. 其他 -> connecting"""
         with self._state_lock:
+            if self._suspended:
+                return STATUS_UNAVAILABLE, None, self._source_label
             if self._wanted_owner != owner:
                 return STATUS_IDLE, None, self._source_label
 

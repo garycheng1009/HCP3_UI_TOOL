@@ -1049,6 +1049,16 @@ def refresh_recording_page():
     current_recording_refresh_token += 1
     refresh_token = current_recording_refresh_token
 
+    # 2026-10-14：還沒回到 CONNECTED（DISCONNECTED／RECOVERING）不做完整
+    # refresh——例如 RECOVERING 期間使用者點 Recording Tab、或 SD 卡插回
+    # 通知。維持 Disconnected 畫面，等 CONNECTED 時 reconnect callback 會
+    # 再呼叫一次這裡。
+    if api.get_dvr_connection_state() != api.DVR_CONNECTION_CONNECTED:
+        print(f'[Recording] refresh 略過：DVR 連線狀態={api.get_dvr_connection_state()}，維持 Disconnected 畫面')
+        show_dvr_disconnected_screen()
+        start_connection_monitor_loop()
+        return
+
     recording_button.config(state='disabled')
     event_button.config(state='disabled')
     photo_button.config(state='disabled')
@@ -1118,53 +1128,6 @@ def _apply_if_current_refresh(refresh_token, func, *args):
         func(*args)
 
 
-def recover_baseline_then_refresh_recording_page():
-    """DVR Disconnect -> Reconnect 時呼叫（取代直接呼叫
-    refresh_recording_page()，由 DA005ControlPanel.pyw 的
-    on_dvr_reconnected_globally() 呼叫）。
-
-    2026-08-20 使用者要求：Reconnect 當下不能直接恢復 Recording 按鈕——
-    因為 reboot 通常會伴隨 KeepAlive 暫時中斷再恢復，斷線期間 DVR 很可能
-    剛好 Restart/Reboot 回到 WITH_RINGBUFFER。這裡先在背景執行緒 GET 一次
-    DvrMode，透過共用的 ensure_without_ringbuffer_idle_baseline() 判斷
-    要不要做 baseline recovery；不論結果是「本來就不需要」、「需要且成功」
-    還是「需要但失敗」，都統一交給既有的 refresh_recording_page() 用最新
-    真實狀態重新整理畫面、re-enable 按鈕（跟 Startup Sync 收尾方式一致，
-    不另外自己管按鈕狀態）。"""
-    thread = threading.Thread(target=_recover_baseline_then_refresh_worker, daemon=True)
-    thread.start()
-
-
-def _recover_baseline_then_refresh_worker():
-    try:
-        mode = api.get_dvr_mode()
-    except Exception as error:
-        print(f'[Recording] Reconnect baseline check 讀取 DVR 狀態失敗，略過檢查，直接進行一般 refresh: {error}')
-        preview_canvas.after(0, refresh_recording_page)
-        return
-
-    # 2026-08-19 使用者要求：這裡確認 GET DvrMode 成功，代表這次真的是
-    # Reconnect（斷線後重新連上，這個新的 Connected Session），自動送一次
-    # PC Current Time。_connection_check_tick() 是 edge-triggered（只在
-    # disconnected -> connected 這個轉換瞬間才呼叫到這支 worker，見該函式
-    # 註解），所以這裡天生就是「每個新 Session 只呼叫一次」，不用另外
-    # 加旗標防重複。失敗只印 log，不擋下面既有的 baseline recovery 流程。
-    api.sync_current_time_once('reconnect')
-
-    result = ensure_without_ringbuffer_idle_baseline(known_mode=mode)
-    if result == BASELINE_RECOVERY_RECOVERED:
-        print('[Recording] Reconnect：偵測到 actual=WITH_RINGBUFFER，已成功恢復 WITHOUT_RINGBUFFER + NO_EVENT baseline')
-    elif result == BASELINE_RECOVERY_FAILED:
-        print('[Recording] Reconnect：baseline recovery 未能成功，仍會繼續進行一般 refresh（維持既有錯誤處理，不阻擋使用者）')
-    elif result == BASELINE_RECOVERY_IN_PROGRESS:
-        # Reconnect 本身不用排隊等待別的 recovery——讓路後照常 refresh，
-        # refresh_recording_page() 會用最新真實狀態重新整理，不會顯示
-        # 過期資訊；真正持有 lock 的那個呼叫端結束時自己會再 refresh 一次。
-        print('[Recording] Reconnect：偵測到已經有另一個 recovery 在進行中，這次直接讓路，仍會繼續進行一般 refresh')
-
-    preview_canvas.after(0, refresh_recording_page)
-
-
 # ============================================================
 # DVR 連線狀態監測（2026-08-18 新增，2026-08-19 改成全域監測）
 # ============================================================
@@ -1186,13 +1149,29 @@ def _recover_baseline_then_refresh_worker():
 #      callback 這兩個掛勾（由 DA005ControlPanel.pyw 設定）通知，讓它決定
 #      「目前在哪個畫面、該怎麼安全退出」，Recording 自己不用知道別的畫面
 #      要做什麼——這樣才不會變成 Recording/Gallery/Player 各自 poll 一份。
+#
+# 2026-10-14 改成三段連線狀態（CONNECTED / DISCONNECTED / RECOVERING，
+# 狀態本身存在 api.py，見那邊「DVR 連線狀態」的說明），這裡是唯一推進
+# 狀態的地方（_update_dvr_connection_state()）：
+#   CONNECTED    --KeepAlive 不通-->  DISCONNECTED（通知 disconnected callback）
+#   DISCONNECTED --KeepAlive 又通-->  RECOVERING（UI 維持 unavailable，不通知）
+#   RECOVERING   --KeepAlive 不通-->  DISCONNECTED（中途作廢，重新等）
+#   RECOVERING   --stable-ready 成立 + 背景 GET DvrMode/baseline recovery 完成-->
+#                 CONNECTED（通知 reconnected callback，才做完整 refresh）
 is_recording_screen_active = False
 _connection_check_after_id = None
 CONNECTION_CHECK_INTERVAL_MS = 1000
-_last_known_dvr_connected = True  # 樂觀預設，跟 api.is_dvr_connected() 的預設值一致
 
-on_dvr_disconnected_global_callback = None   # DA005ControlPanel.pyw 設定：偵測到斷線瞬間呼叫一次
-on_dvr_reconnected_global_callback = None    # DA005ControlPanel.pyw 設定：偵測到恢復連線瞬間呼叫一次
+# RECOVERING 期間背景 GET DvrMode／baseline recovery 的進度。每次進入
+# DISCONNECTED 都把 generation 加一，讓還在跑的舊 worker 晚到的結果直接作廢。
+_reconnect_generation = 0
+_reconnect_worker_running = False
+_reconnect_baseline_done = False
+_reconnect_failed_attempts = 0
+RECONNECT_BASELINE_MAX_ATTEMPTS = 3  # GET DvrMode 連續失敗這麼多次就不再擋，照常進 CONNECTED（跟原本「失敗也不阻擋使用者」一致）
+
+on_dvr_disconnected_global_callback = None   # DA005ControlPanel.pyw 設定：進入 DISCONNECTED 時呼叫
+on_dvr_reconnected_global_callback = None    # DA005ControlPanel.pyw 設定：RECOVERING -> CONNECTED 時呼叫一次
 
 # 2026-08-20 使用者要求：SD Card Presence 監測沿用同一個全域 watcher
 # 迴圈（_connection_check_tick()），不另外開一個迴圈——跟上面 DVR 連線
@@ -1287,27 +1266,32 @@ def _schedule_next_connection_check():
 def _connection_check_tick():
     """只在連線狀態真的「變化」時才動作，不會每一輪都重畫畫面。全域監測
     （不論目前在哪個畫面都會跑，見 start_global_connection_watcher()），
-    這裡只負責偵測狀態變化跟 Recording 自己的 token 失效，不管其他畫面
+    這裡只負責推進連線狀態跟 Recording 自己的 token 失效，不管其他畫面
     要怎麼反應——那是 on_dvr_disconnected_global_callback/
     on_dvr_reconnected_global_callback 的事（DA005ControlPanel.pyw 設定，
-    知道目前在哪個畫面、該怎麼安全退出）。
-    - 連線中 -> 斷線：讓目前正在背景跑的 refresh worker（如果有的話）失效
-      （沿用既有的 current_recording_refresh_token 機制，不用另外發明一套）。
-    - 斷線 -> 恢復連線：不能只是把舊 Thumbnail 顯示回來，呼叫端會透過
-      callback 呼叫既有的 refresh_recording_page()，重新 GET 真實的
-      DvrMode/recordings，依真正狀態顯示 Standby/No Video/Thumbnail。"""
-    global _last_known_dvr_connected, current_recording_refresh_token
+    知道目前在哪個畫面、該怎麼安全退出）。狀態怎麼轉換見
+    _update_dvr_connection_state()。"""
+    # 2026-10-14 暫時診斷 log（跟 api.py 的 [KeepAlive Link] log 對照，確認
+    # 快速拔插時 watcher 是不是只看到 CONNECTED）。開關跟 api.py 共用
+    # api.CONNECTION_DEBUG_LOG，確認完一起關掉或移除。
+    if api.CONNECTION_DEBUG_LOG:
+        api_link_text = 'up' if api.is_keepalive_link_up() else 'DOWN'
+        print(f'[Watcher tick] {api.connection_log_timestamp()} '
+              f'api KeepAlive link={api_link_text}, app state={api.get_dvr_connection_state()}, '
+              f'stable={api.is_dvr_link_stable()}')
 
-    currently_connected = api.is_dvr_connected()
-    if currently_connected != _last_known_dvr_connected:
-        _last_known_dvr_connected = currently_connected
-        if currently_connected:
-            if on_dvr_reconnected_global_callback:
-                on_dvr_reconnected_global_callback()
-        else:
-            current_recording_refresh_token += 1  # 讓任何還在背景跑的舊 refresh worker 的回呼直接失效，不會晚到蓋掉 Disconnected 畫面
-            if on_dvr_disconnected_global_callback:
-                on_dvr_disconnected_global_callback()
+    try:
+        _update_dvr_connection_state()
+    except Exception as error:
+        # 這個 tick 是全域 watcher，不能因為某個 callback 出錯就整個停掉
+        print(f'[Connection] {_now_text()} 更新連線狀態時發生例外（watcher 繼續運作）: {error}')
+
+    # RECOVERING／DISCONNECTED 期間只允許 KeepAlive、GET DvrMode、baseline
+    # recovery。下面兩個通知（Memory、DvrMode 變化）先不 consume，等回到
+    # CONNECTED 的下一輪 tick 才處理，通知不會遺失。
+    if api.get_dvr_connection_state() != api.DVR_CONNECTION_CONNECTED:
+        _schedule_next_connection_check()
+        return
 
     # 2026-08-20 新增：SD Card Presence。api.consume_memory_change_
     # notification() 是非阻塞的檢查，只有 KeepAlive 真的收到過
@@ -1330,6 +1314,152 @@ def _connection_check_tick():
         threading.Thread(target=_handle_runtime_dvr_mode_change_notification, daemon=True).start()
 
     _schedule_next_connection_check()  # 全域監測，全程持續跑，不再受 is_recording_screen_active 限制
+
+
+def _now_text():
+    """log 用的時間戳（到毫秒），方便跟 FW log 對時間。"""
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+def _update_dvr_connection_state():
+    """依目前連線狀態跟 KeepAlive 結果，決定要不要換到下一個狀態
+    （狀態圖見 is_recording_screen_active 上面那段說明）。"""
+    state = api.get_dvr_connection_state()
+    link_up = api.is_keepalive_link_up()
+
+    if state == api.DVR_CONNECTION_CONNECTED:
+        if not link_up:
+            _enter_dvr_disconnected()
+    elif state == api.DVR_CONNECTION_DISCONNECTED:
+        if link_up:
+            _enter_dvr_recovering()
+    elif state == api.DVR_CONNECTION_RECOVERING:
+        if not link_up:
+            print(f'[Connection] {_now_text()} RECOVERING 期間 KeepAlive 又斷了，回到 DISCONNECTED')
+            _enter_dvr_disconnected()
+        else:
+            _advance_dvr_recovery()
+
+
+def _enter_dvr_disconnected():
+    global current_recording_refresh_token, _reconnect_generation
+    global _reconnect_worker_running, _reconnect_baseline_done, _reconnect_failed_attempts
+    print(f'[Connection] {_now_text()} -> DISCONNECTED')
+    api.set_dvr_connection_state(api.DVR_CONNECTION_DISCONNECTED)
+
+    # 重設 recovery 進度；generation 加一，讓還在跑的舊 worker 結果作廢
+    _reconnect_generation += 1
+    _reconnect_worker_running = False
+    _reconnect_baseline_done = False
+    _reconnect_failed_attempts = 0
+
+    current_recording_refresh_token += 1  # 讓任何還在背景跑的舊 refresh worker 的回呼直接失效，不會晚到蓋掉 Disconnected 畫面
+    if on_dvr_disconnected_global_callback:
+        on_dvr_disconnected_global_callback()
+
+
+def _enter_dvr_recovering():
+    """KeepAlive 又通了，但先不當作恢復：UI 維持 Disconnected 畫面、
+    Live View 維持 suspend，不呼叫任何 callback。"""
+    print(f'[Connection] {_now_text()} -> RECOVERING（等 KeepAlive 連續成功 '
+          f'{api.DVR_STABLE_SUCCESS_COUNT} 次，再做 GET DvrMode／baseline recovery）')
+    api.set_dvr_connection_state(api.DVR_CONNECTION_RECOVERING)
+    _advance_dvr_recovery()
+
+
+def _is_dvr_stable_ready():
+    """RECOVERING -> CONNECTED 的穩定條件。之後 RD 提供 UVC ready 訊號時，
+    只要改 api.is_uvc_pipeline_ready()，這裡不用動。"""
+    return api.is_dvr_link_stable() and api.is_uvc_pipeline_ready()
+
+
+def _advance_dvr_recovery():
+    """RECOVERING 期間每一輪 tick 呼叫一次（worker 完成時也會呼叫一次）：
+    1. stable-ready 還沒成立 -> 繼續等
+    2. 還沒做過 GET DvrMode／baseline recovery -> 背景開始做（同時間只跑一個）
+    3. 都完成了 -> 進入 CONNECTED"""
+    global _reconnect_worker_running
+    if api.get_dvr_connection_state() != api.DVR_CONNECTION_RECOVERING:
+        return
+    if not _is_dvr_stable_ready():
+        return
+
+    if not _reconnect_baseline_done:
+        if not _reconnect_worker_running:
+            _reconnect_worker_running = True
+            print(f'[Connection] {_now_text()} stable-ready 成立，背景開始 GET DvrMode／baseline recovery')
+            thread = threading.Thread(target=_reconnect_baseline_worker, args=(_reconnect_generation,), daemon=True)
+            thread.start()
+        return
+
+    _enter_dvr_connected()
+
+
+def _reconnect_baseline_worker(generation):
+    """背景執行緒：RECOVERING 期間唯一會打的 API（GET DvrMode、時間同步、
+    baseline recovery），不打 GetRecordings、不下載縮圖。
+
+    2026-08-20 使用者要求（沿用）：斷線期間 DVR 很可能剛好 Restart/Reboot，
+    actual mode 可能回到 WITH_RINGBUFFER，所以先透過共用的
+    ensure_without_ringbuffer_idle_baseline() 判斷要不要做 baseline
+    recovery；不論結果如何都不阻擋，CONNECTED 後交給 refresh_recording_page()
+    用最新真實狀態重新整理畫面。"""
+    try:
+        mode = api.get_dvr_mode()
+    except Exception as error:
+        print(f'[Connection] {_now_text()} RECOVERING：GET DvrMode 失敗: {error}')
+        preview_canvas.after(0, lambda: _on_reconnect_baseline_finished(generation, False))
+        return
+
+    # 2026-08-19 使用者要求：每個新的 Connected Session 自動送一次 PC Current
+    # Time。這支 worker 每個 RECOVERING 只會成功跑完一次（成功後
+    # _reconnect_baseline_done=True 就不會再開），所以不會重複送。失敗只印
+    # log，不擋下面的 baseline recovery。
+    api.sync_current_time_once('reconnect')
+
+    result = ensure_without_ringbuffer_idle_baseline(known_mode=mode)
+    if result == BASELINE_RECOVERY_RECOVERED:
+        print('[Recording] Reconnect：偵測到 actual=WITH_RINGBUFFER，已成功恢復 WITHOUT_RINGBUFFER + NO_EVENT baseline')
+    elif result == BASELINE_RECOVERY_FAILED:
+        print('[Recording] Reconnect：baseline recovery 未能成功，仍會繼續進行一般 refresh（維持既有錯誤處理，不阻擋使用者）')
+    elif result == BASELINE_RECOVERY_IN_PROGRESS:
+        # 已經有另一個 recovery 在進行中：讓路，CONNECTED 後照常 refresh；
+        # 真正持有 lock 的那個呼叫端結束時自己會再 refresh 一次。
+        print('[Recording] Reconnect：偵測到已經有另一個 recovery 在進行中，這次直接讓路，仍會繼續進行一般 refresh')
+
+    preview_canvas.after(0, lambda: _on_reconnect_baseline_finished(generation, True))
+
+
+def _on_reconnect_baseline_finished(generation, succeeded):
+    """main thread：_reconnect_baseline_worker 完成。"""
+    global _reconnect_worker_running, _reconnect_baseline_done, _reconnect_failed_attempts
+    if generation != _reconnect_generation:
+        print(f'[Connection] {_now_text()} 舊的 recovery 結果（中間又斷線過），直接丟棄')
+        return
+    _reconnect_worker_running = False
+
+    if succeeded:
+        _reconnect_baseline_done = True
+    else:
+        _reconnect_failed_attempts += 1
+        if _reconnect_failed_attempts >= RECONNECT_BASELINE_MAX_ATTEMPTS:
+            # 不無限擋住使用者：KeepAlive 一直穩定，只是 GET DvrMode 失敗，
+            # 照原本行為進 CONNECTED，交給 refresh_recording_page() 顯示錯誤
+            print(f'[Connection] {_now_text()} GET DvrMode 已失敗 {_reconnect_failed_attempts} 次，不再擋，照常進入 CONNECTED')
+            _reconnect_baseline_done = True
+        else:
+            print(f'[Connection] {_now_text()} 下一輪 tick 再試一次 GET DvrMode'
+                  f'（{_reconnect_failed_attempts}/{RECONNECT_BASELINE_MAX_ATTEMPTS}）')
+            return
+
+    _advance_dvr_recovery()  # 不用等下一輪 tick，條件都成立就馬上進 CONNECTED
+
+
+def _enter_dvr_connected():
+    print(f'[Connection] {_now_text()} -> CONNECTED')
+    api.set_dvr_connection_state(api.DVR_CONNECTION_CONNECTED)
+    if on_dvr_reconnected_global_callback:
+        on_dvr_reconnected_global_callback()
 
 
 def _handle_runtime_dvr_mode_change_notification():
@@ -2139,6 +2269,11 @@ def _live_view_tick():
         return
 
     status, error_message, _source_label = _live_view_controller.get_status(_live_view_owner)
+    if status == live_view_controller_module.STATUS_UNAVAILABLE:
+        # 2026-10-14：Dashcam 斷線／RECOVERING 中，controller 已 suspend。
+        # 跟 error 一樣交給呼叫端收掉 Live View（不會自動重開）
+        error_message = 'Dashcam 斷線或恢復中，Live View 暫停'
+        status = live_view_controller_module.STATUS_ERROR
     if status == live_view_controller_module.STATUS_ERROR:
         # 交給呼叫端處理（停止 stream、恢復縮圖、按鈕回到未啟用），這裡不再排下一次 tick
         if _live_view_on_error_callback:

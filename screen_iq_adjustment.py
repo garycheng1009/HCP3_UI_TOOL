@@ -859,7 +859,18 @@ def _live_view_tick():
     elif status == live_view_controller_module.STATUS_ERROR:
         _render_live_view_message('Live View unavailable')
         live_view_retry_button.place(relx=0.5, rely=0.62, anchor='n')
-    else:  # connecting / idle：還沒拿到第一張畫面
+    elif status == live_view_controller_module.STATUS_UNAVAILABLE:
+        # 2026-10-14：Dashcam 斷線／恢復中（controller 被 suspend）。這時候
+        # 按 Retry 也會被忽略，所以不顯示 Retry
+        live_view_retry_button.place_forget()
+        _render_live_view_message('Live View unavailable')
+    elif status == live_view_controller_module.STATUS_IDLE:
+        # 2026-10-14：頁面還開著，但 controller 已經沒有幫這頁開 stream
+        # （例如恢復中進到這頁、恢復後 controller resume 但不自動重開）。
+        # 顯示 Retry，讓使用者自己再開一次
+        _render_live_view_message('Live View unavailable')
+        live_view_retry_button.place(relx=0.5, rely=0.62, anchor='n')
+    else:  # connecting：還沒拿到第一張畫面
         live_view_retry_button.place_forget()
         _render_live_view_message('Starting Live View...')
 

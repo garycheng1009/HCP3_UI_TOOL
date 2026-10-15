@@ -323,8 +323,20 @@ def on_dvr_disconnected_globally():
     的 KeepAlive-based 全域監測（見 screen_recording.start_global_
     connection_watcher()，只讀 api.is_dvr_connected() 這個記憶體旗標，
     不是另一套 GET polling），這裡只負責「目前在哪個畫面、該怎麼安全
-    退出」，不重複發明連線偵測機制。"""
+    退出」，不重複發明連線偵測機制。
+
+    2026-10-14：斷線（DISCONNECTED）時統一在這裡收掉 Live View——先用首頁
+    既有的 stop_live_view_if_active() 收掉首頁 Live View 畫面/按鈕（原本
+    斷線當下已經在 Recording 頁時，首頁 Live View 完全沒被停掉），再把
+    共用 controller suspend（不管 owner 是誰都停、清 owner、恢復前不接受
+    start）。IQ 頁面不用另外處理：下面切回 Recording 時 show_screen() 本來
+    就會停掉 IQ 的 Live View。
+    順序不能反過來：先 suspend 會清掉 owner，stop_live_view_if_active()
+    就判斷不到首頁「Connecting 中」的狀態，按鈕會卡在 Connecting。"""
     global settings_return_screen
+    stop_live_view_if_active()
+    shared_live_view_controller.suspend()
+
     if current_screen_name in ('gallery', 'favorite'):
         screen_gallery.cancel_pending_work_for_disconnect()
     elif current_screen_name == 'player':
@@ -346,22 +358,21 @@ def on_dvr_disconnected_globally():
 
 
 def on_dvr_reconnected_globally():
-    """DVR 恢復連線：不管斷線當下在哪個畫面，都維持/確保停在 Recording
-    首頁，不自動送回原本的 Gallery/Favorite/Player。
+    """DVR 恢復連線（RECOVERING -> CONNECTED）：不管斷線當下在哪個畫面，
+    都維持/確保停在 Recording 首頁，不自動送回原本的 Gallery/Favorite/Player。
 
-    2026-08-20 使用者要求：不要直接呼叫 refresh_recording_page() 恢復
-    Recording 按鈕——斷線期間 DVR 很可能剛好 Restart/Reboot，actual mode
-    可能回到 WITH_RINGBUFFER；改呼叫
-    screen_recording.recover_baseline_then_refresh_recording_page()，
-    先在背景檢查、需要的話先做一次 WITHOUT_RINGBUFFER + NO_EVENT baseline
-    recovery 並確認成功，最後才呼叫既有的 refresh_recording_page() 重新
-    同步 DVR Mode/Recording state/recordings/preview。Gallery/Favorite Tab
-    要不要重新出現，繼續交給 refresh_recording_page() 內部已經在呼叫的
-    screen_gallery.report_gallery_item_count_from_recordings()（既有機制，
-    這裡不用另外處理，也不會多打一次 API）。"""
+    2026-10-14：呼叫這裡之前，全域 watcher 已經在 RECOVERING 期間確認過
+    KeepAlive 穩定（stable-ready），也做完 GET DvrMode／baseline recovery
+    （2026-08-20 的 WITH_RINGBUFFER 檢查，見 screen_recording.
+    _reconnect_baseline_worker()），所以這裡直接：
+    1. resume 共用 Live View controller——只是允許再開，不自動重開，
+       使用者要自己再點 Live View／重新進 IQ（或按 Retry）。
+    2. 呼叫既有的 refresh_recording_page() 做完整 refresh（DvrMode/
+       recordings/縮圖），Gallery/Favorite Tab 要不要重新出現也是它負責。"""
+    shared_live_view_controller.resume()
     if current_screen_name != 'recording':
         show_screen('recording')
-    screen_recording.recover_baseline_then_refresh_recording_page()
+    screen_recording.refresh_recording_page()
 
 
 screen_recording.on_dvr_disconnected_global_callback = on_dvr_disconnected_globally
@@ -1079,6 +1090,12 @@ def on_live_view_button_clicked():
     is_home_requested = shared_live_view_controller.is_requested_by(HOME_LIVE_VIEW_OWNER)
     if live_view_is_active or is_home_requested:
         stop_live_view_if_active()
+        return
+
+    # 2026-10-14：Dashcam 斷線／RECOVERING 中（共用 controller 被 suspend），
+    # 不能開 Live View，畫面維持 Disconnected，不做任何事
+    if shared_live_view_controller.is_suspended():
+        print('[Live View] Dashcam 斷線或恢復中，暫時不能開啟 Live View')
         return
 
     if current_screen_name != 'recording':

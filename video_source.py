@@ -293,6 +293,10 @@ UVC_INPUT_FPS = 30
 UVC_MAC_PIXEL_FORMAT = 'uyvy422'       # macOS AVFoundation 實測可用的像素格式
 
 UVC_FIRST_FRAME_TIMEOUT_SECONDS = 10   # start() 後這麼多秒還沒收到第一張畫面，就算失敗
+# 2026-10-14 新增：收到第一張畫面之後，這麼多秒完全沒有新畫面就判定 stream
+# stalled。快速拔插 Dashcam 時 FW 會中途 stop UVC，但 ffmpeg 不一定會結束，
+# 原本只有「第一張畫面逾時」，畫面就一直停在最後一張、不會顯示 unavailable。
+UVC_STALE_FRAME_TIMEOUT_SECONDS = 2
 UVC_STDERR_KEEP_LINES = 20             # ffmpeg 錯誤訊息只保留最近這麼多行，不會無限累積
 UVC_STOP_WAIT_SECONDS = 2              # stop 時等 ffmpeg 結束、等 thread 結束的秒數
 
@@ -333,6 +337,8 @@ class FFmpegUVCVideoSource(VideoSource):
         self._start_time = None
         self._first_frame_seconds = None   # 從 start() 到收到第一張畫面花了幾秒
         self._timeout_logged = False       # 第一張畫面逾時的 log 只印一次
+        self._last_frame_time = None       # 最近一次收到新畫面的時間（time.time()），stalled 判斷用
+        self._stall_logged = False         # stalled 的 log 只印一次
 
     def get_frame_size(self):
         """回傳 (width, height)，呼叫端要用這個尺寸還原 read_frame() 的 bytes。"""
@@ -396,6 +402,8 @@ class FFmpegUVCVideoSource(VideoSource):
         self._start_time = time.time()
         self._first_frame_seconds = None
         self._timeout_logged = False
+        self._last_frame_time = None
+        self._stall_logged = False
         with self._frame_lock:
             self._latest_frame_bytes = None
         with self._stderr_lock:
@@ -485,6 +493,7 @@ class FFmpegUVCVideoSource(VideoSource):
                     continue  # 正在停止：繼續讀 stdout 讓 ffmpeg 能正常結束，畫面丟掉
                 with self._frame_lock:
                     self._latest_frame_bytes = frame_bytes
+                self._last_frame_time = time.time()
                 if self._first_frame_seconds is None:
                     self._first_frame_seconds = time.time() - self._start_time
                     _uvc_log(f'收到第一張畫面，耗時 {self._first_frame_seconds:.2f} 秒')
@@ -586,6 +595,18 @@ class FFmpegUVCVideoSource(VideoSource):
                 if not self._timeout_logged:
                     _uvc_log(f'{message}，ffmpeg 最後訊息：{self._get_last_stderr_line()}')
                     self._timeout_logged = True
+                return message
+
+        # 2026-10-14：收過畫面之後停止更新（stream stalled）：ffmpeg 還活著，
+        # 但超過 UVC_STALE_FRAME_TIMEOUT_SECONDS 秒沒有新畫面
+        if self._process is not None and self._last_frame_time is not None:
+            seconds_since_last_frame = time.time() - self._last_frame_time
+            if seconds_since_last_frame > UVC_STALE_FRAME_TIMEOUT_SECONDS:
+                message = f'UVC 畫面停止更新（{UVC_STALE_FRAME_TIMEOUT_SECONDS} 秒沒有新畫面，裝置="{self._device_name}"）'
+                if not self._stall_logged:
+                    _uvc_log(f'{message}，距離上一張 {seconds_since_last_frame:.2f} 秒，'
+                             f'ffmpeg 最後訊息：{self._get_last_stderr_line()}')
+                    self._stall_logged = True
                 return message
 
         return None

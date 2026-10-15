@@ -19,7 +19,7 @@ import threading
 import tempfile
 import queue
 from datetime import datetime
-from time import sleep, time, perf_counter
+from time import sleep, time, perf_counter, monotonic
 from io import BytesIO
 import requests
 from PIL import Image
@@ -100,8 +100,25 @@ def send_put(path, message_bytes, timeout=10):
     return response.content
 
 
+class DvrNotReadyError(requests.ConnectionError):
+    """2026-10-14 新增：DVR 還沒回到 CONNECTED（DISCONNECTED 或 RECOVERING）
+    時，GetRecordings／檔案下載直接丟這個例外，不真的送出 HTTP 請求。
+    繼承 requests.ConnectionError，呼叫端既有的「網路失敗」except 分支
+    不用改就會照常處理（跟真的斷線一樣）。"""
+
+
+def _raise_if_dvr_not_ready(action_name):
+    """快速拔插時 NCM/API 會比 UVC 早恢復，RECOVERING 期間只允許
+    KeepAlive、GET DvrMode、baseline recovery，GetRecordings 跟縮圖/檔案
+    下載要等回到 CONNECTED 才放行（見下面「DVR 連線狀態」那一段的說明）。"""
+    state = get_dvr_connection_state()
+    if state != DVR_CONNECTION_CONNECTED:
+        raise DvrNotReadyError(f'{action_name} 暫停：DVR 連線狀態={state}，等回到 connected 才送出')
+
+
 def download_file(url, timeout=30):
     """下載任意檔案（縮圖、影片都會用到），回傳原始 bytes"""
+    _raise_if_dvr_not_ready('檔案下載')
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return response.content
@@ -369,6 +386,7 @@ def take_photo():
 
 def get_recordings():
     """GET /dashcam/recordings，回傳 Recording 物件的清單"""
+    _raise_if_dvr_not_ready('GET recordings')
     data = send_get('/dashcam/recordings')
     message = audi_pb2.Recordings()
     message.ParseFromString(data)
@@ -1250,34 +1268,161 @@ KEEPALIVE_CYCLE_SECONDS = 0.05  # 送快一點，留更多緩衝空間給連線�
 # 每次週期約 100ms，約 0.5 秒），避免單一次網路小抖動就誤判；恢復連線
 # 則是只要有一次成功就馬上算數（斷線要穩定確認、恢復要盡快讓使用者知道，
 # 是常見的不對稱判斷方式）。
+#
+# 2026-10-14 修改（快速拔插 Dashcam 後 Live View 卡住）：快速拔插時 NCM/
+# API 會比 UVC 早恢復，「KeepAlive 成功一次就算恢復」會讓 App 在 UVC 還在
+# reset 時就開始 GetRecordings/縮圖、使用者也能馬上開 Live View。改成三段
+# 連線狀態，由 screen_recording 的全域 watcher（_connection_check_tick()）
+# 統一推進，這裡只負責保存：
+#   CONNECTED    -- 正常
+#   DISCONNECTED -- KeepAlive 連續失敗達門檻
+#   RECOVERING   -- KeepAlive 又通了，但還沒確認穩定：只允許 KeepAlive、
+#                   GET DvrMode、baseline recovery；GetRecordings／下載被
+#                   _raise_if_dvr_not_ready() 擋住；Live View 不能啟動
+# RECOVERING -> CONNECTED 的條件（stable-ready）：KeepAlive 連續成功
+# DVR_STABLE_SUCCESS_COUNT 次（中途失敗一次就重新計數）＋ is_uvc_pipeline_
+# ready()（目前固定 True，預留給之後 RD 提供的 UVC ready 訊號）。
 _dvr_connected = None                    # None＝還沒有任何一次 KeepAlive 結果（工具剛啟動）
 _consecutive_keepalive_failures = 0
-_dvr_connection_lock = threading.Lock()  # 保護 _dvr_connected/_consecutive_keepalive_failures：KeepAlive 背景執行緒寫、UI 執行緒讀
+_consecutive_keepalive_successes = 0
+_dvr_connection_lock = threading.Lock()  # 保護上面三個變數＋_dvr_connection_state：KeepAlive 背景執行緒寫、UI 執行緒讀
 DVR_DISCONNECT_FAILURE_THRESHOLD = 5
+DVR_STABLE_SUCCESS_COUNT = 20            # 約 50ms 一次，20 次約 1 秒
+
+DVR_CONNECTION_CONNECTED = 'connected'
+DVR_CONNECTION_DISCONNECTED = 'disconnected'
+DVR_CONNECTION_RECOVERING = 'recovering'
+_dvr_connection_state = DVR_CONNECTION_CONNECTED  # 樂觀預設，跟 is_dvr_connected() 的預設一致
 
 
-def is_dvr_connected():
-    """回傳目前是否連得上 DVR，資料來源是既有 KeepAlive 背景執行緒持續
-    更新的旗標，呼叫這支函式本身不會觸發任何新的網路請求。還沒有任何一次
-    KeepAlive 結果時（None）視同已連線（樂觀預設，避免工具剛啟動、
-    KeepAlive 還沒送出第一次就先顯示斷線畫面）。"""
+def is_keepalive_link_up():
+    """KeepAlive 層面的「通不通」（原本 is_dvr_connected() 的判斷）：連續失敗
+    達到門檻才算不通，成功一次就算通。只給全域 watcher 推進連線狀態用，
+    一般畫面請用 is_dvr_connected()。還沒有任何一次 KeepAlive 結果時（None）
+    視同通（樂觀預設，避免工具剛啟動就先顯示斷線畫面）。"""
     with _dvr_connection_lock:
         return _dvr_connected if _dvr_connected is not None else True
 
 
-def _mark_keepalive_success():
-    global _dvr_connected, _consecutive_keepalive_failures
+def is_dvr_link_stable():
+    """KeepAlive 已經連續成功 DVR_STABLE_SUCCESS_COUNT 次（中途沒有失敗）。"""
     with _dvr_connection_lock:
+        return _consecutive_keepalive_successes >= DVR_STABLE_SUCCESS_COUNT
+
+
+def is_uvc_pipeline_ready():
+    """預留的擴充點：UVC pipeline 是不是已經 ready。
+
+    TODO：RD 確認有 API/status 可以查 UVC ready 之後，在這裡改成查詢它
+    （注意：這支會在 main thread 的 watcher tick 裡呼叫，如果要送 HTTP，
+    要改成背景查詢後把結果存起來，這裡只讀結果）。目前沒有這個訊號，
+    固定回傳 True，stable-ready 只看 KeepAlive 是否穩定。"""
+    return True
+
+
+def get_dvr_connection_state():
+    with _dvr_connection_lock:
+        return _dvr_connection_state
+
+
+def set_dvr_connection_state(state):
+    """只有 screen_recording 的全域 watcher 會呼叫，其他地方只讀。"""
+    global _dvr_connection_state
+    with _dvr_connection_lock:
+        _dvr_connection_state = state
+
+
+def is_dvr_connected():
+    """DVR 是不是「可以正常使用」：KeepAlive 通，而且連線狀態已經回到
+    CONNECTED。RECOVERING 期間回傳 False，所以既有呼叫端（例如 refresh
+    worker 的錯誤分支）會照「斷線」處理、顯示 Disconnected 畫面。呼叫這支
+    函式本身不會觸發任何新的網路請求。"""
+    return is_keepalive_link_up() and get_dvr_connection_state() == DVR_CONNECTION_CONNECTED
+
+
+# ---- 2026-10-14 暫時診斷 log：確認快速拔插時 watcher 是否漏掉 DISCONNECTED ----
+# KeepAlive thread 每 ~50ms 更新狀態，但全域 watcher 每 1 秒才看一次「目前
+# 狀態」，懷疑短暫斷線（例如 300ms）會在兩次 tick 之間發生又恢復，watcher
+# 完全看不到。這裡在 KeepAlive 狀態「真正變化」的那一刻印 log（牆上時間＋
+# monotonic），跟 watcher tick 的 log 對照。確認完要關掉（改 False）或移除。
+CONNECTION_DEBUG_LOG = False
+_last_keepalive_failure_reason = ''    # 最近一次失敗的原因（例外類型＋耗時），只給 log 用
+_link_down_monotonic = None            # 判定斷線那一刻的 monotonic 時間，算斷了多久用
+_first_failure_monotonic = None        # 這一串失敗的第一次失敗時間
+
+
+def connection_log_timestamp():
+    """診斷 log 用的時間戳：牆上時間（跟 FW log 對）＋ monotonic（算間隔）。"""
+    wall_text = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    return f'{wall_text} mono={monotonic():.3f}'
+
+
+def _connection_debug_print(message):
+    if CONNECTION_DEBUG_LOG:
+        print(f'[KeepAlive Link] {connection_log_timestamp()} {message}')
+
+
+def _mark_keepalive_success():
+    global _dvr_connected, _consecutive_keepalive_failures, _consecutive_keepalive_successes
+    global _link_down_monotonic, _first_failure_monotonic
+    log_message = None
+    with _dvr_connection_lock:
+        was_link_down = (_dvr_connected is False)
+        failures_before = _consecutive_keepalive_failures
+
         _dvr_connected = True
         _consecutive_keepalive_failures = 0
+        if _consecutive_keepalive_successes < DVR_STABLE_SUCCESS_COUNT:
+            _consecutive_keepalive_successes += 1  # 數到門檻就停，不用一直往上加
+            if _consecutive_keepalive_successes == DVR_STABLE_SUCCESS_COUNT:
+                log_message = f'連續成功達 {DVR_STABLE_SUCCESS_COUNT} 次（stable）'
+
+        # 診斷 log：狀態真正變化的時候才印
+        if was_link_down:
+            down_seconds = monotonic() - _link_down_monotonic if _link_down_monotonic is not None else -1
+            log_message = (f'DISCONNECTED -> 第一次成功（link up），前面連續失敗 {failures_before} 次，'
+                           f'判定斷線後 {down_seconds:.3f}s 恢復')
+            _link_down_monotonic = None
+        elif failures_before > 0:
+            failing_seconds = monotonic() - _first_failure_monotonic if _first_failure_monotonic is not None else -1
+            log_message = (f'失敗 {failures_before} 次後恢復（未達斷線門檻 {DVR_DISCONNECT_FAILURE_THRESHOLD}，'
+                           f'不會判定斷線），失敗期間 {failing_seconds:.3f}s')
+        if failures_before > 0:
+            _first_failure_monotonic = None
+    if log_message:
+        _connection_debug_print(log_message)
 
 
 def _mark_keepalive_failure():
-    global _dvr_connected, _consecutive_keepalive_failures
+    global _dvr_connected, _consecutive_keepalive_failures, _consecutive_keepalive_successes
+    global _link_down_monotonic, _first_failure_monotonic
+    log_message = None
     with _dvr_connection_lock:
         _consecutive_keepalive_failures += 1
+        _consecutive_keepalive_successes = 0  # 中途任何一次失敗，stable-ready 就重新計數
+
+        if _consecutive_keepalive_failures == 1:
+            _first_failure_monotonic = monotonic()
+            log_message = f'第一次失敗（{_last_keepalive_failure_reason}）'
+
         if _consecutive_keepalive_failures >= DVR_DISCONNECT_FAILURE_THRESHOLD:
+            if _dvr_connected is not False:
+                # 診斷 log：CONNECTED -> DISCONNECTED 真正發生的那一刻
+                _link_down_monotonic = monotonic()
+                failing_seconds = _link_down_monotonic - _first_failure_monotonic
+                log_message = (f'CONNECTED -> DISCONNECTED（連續失敗 {_consecutive_keepalive_failures} 次，'
+                               f'從第一次失敗算 {failing_seconds:.3f}s，最後一次：{_last_keepalive_failure_reason}）')
             _dvr_connected = False
+    if log_message:
+        _connection_debug_print(log_message)
+
+
+def _record_keepalive_failure_reason(reason, request_start_time):
+    """診斷 log 用：記下這次失敗的原因跟這次請求花了多久（例如
+    ConnectTimeout 會花滿 1 秒 timeout，ConnectionError 通常馬上失敗），
+    可以看出「連續失敗 5 次」實際上花了多久。"""
+    global _last_keepalive_failure_reason
+    _last_keepalive_failure_reason = f'{reason}，請求耗時 {time() - request_start_time:.3f}s'
 
 
 def _run_keepalive_loop():
@@ -1307,12 +1452,15 @@ def _run_keepalive_loop():
                 _mark_keepalive_success()
             else:
                 _keepalive_queue.put(0)  # 失敗就歸零重新開始
+                _record_keepalive_failure_reason(f'HTTP {response.status_code}', cycle_start_time)
                 _mark_keepalive_failure()
-        except requests.RequestException:
+        except requests.RequestException as error:
             _keepalive_queue.put(0)
+            _record_keepalive_failure_reason(type(error).__name__, cycle_start_time)
             _mark_keepalive_failure()
         except Exception as error:
             print(f'[keepalive] 未預期的錯誤: {error}')
+            _record_keepalive_failure_reason(f'未預期錯誤 {type(error).__name__}', cycle_start_time)
             _mark_keepalive_failure()
 
         # 實測發現：不管這一輪 HTTP 請求花了多久都固定再 sleep(0.1)，會讓整個
