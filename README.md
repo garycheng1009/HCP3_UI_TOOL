@@ -7,7 +7,7 @@ https://jetoptotw.sharepoint.com/:f:/t/DA005AudiDashcam/IgAUbpn6jWe9SYf9PuDvNfrA
 
 DA005 行車紀錄器的桌面控制工具（Tkinter GUI），透過 REST API / Protobuf 跟真機溝通，
 提供 Recording／Gallery／Player／Settings 幾個畫面，可以錄影、瀏覽影片與照片、
-Favorite／Delete、Format SD Card、調整 Dashcam 設定等操作。目前版本：v2.0。
+Favorite／Delete、Format SD Card、調整 Dashcam 設定等操作。目前版本：v3.0。
 
 ## 執行
 
@@ -16,8 +16,8 @@ Favorite／Delete、Format SD Card、調整 Dashcam 設定等操作。目前版�
 - 或 `執行DA005ControlPanel_除錯用.bat`：會保留 console 視窗，方便看錯誤訊息
 
 **已打包版本（不需要裝 Python）**
-- `dist/Dashcam_Control_Panel_v2.0/Dashcam_Control_Panel_v2.0.exe`
-- 需要整個 `Dashcam_Control_Panel_v2.0` 資料夾一起帶走，不能只拷貝 exe
+- `dist/Dashcam_Control_Panel_v3.0/Dashcam_Control_Panel_v3.0.exe`
+- 需要整個 `Dashcam_Control_Panel_v3.0` 資料夾一起帶走，不能只拷貝 exe
 - 2026-09-16 使用者要求：打包產出名稱從 DA005_DVR_Control_Panel 改成
   Dashcam_Control_Panel（.spec 檔案本身檔名不變，只改 EXE()/COLLECT()
   裡的 name= 設定，見 `Control_Panel_windows.spec` / `Control_Panel_mac.spec` 開頭說明）

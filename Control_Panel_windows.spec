@@ -12,6 +12,10 @@ v1.0 那份 spec 的說明，這裡不重複。
    出錯時看 traceback；這輪功能驗證已完成、準備正式發行，改成不顯示
    Console/Terminal 視窗（windowed）。
 
+2026-10-15 v3.0：版本名稱從 v2.0 改成 v3.0（exe 檔名、COLLECT 資料夾名稱、
+macOS .app 名稱都跟著改），跟 DA005ControlPanel.pyw 的 MAIN_WINDOW_TITLE
+（視窗標題）一致。
+
 打包方式（在這支 .spec 檔案所在資料夾執行）：
     pyinstaller Control_Panel_windows.spec
 
@@ -84,9 +88,9 @@ exe = EXE(
     exclude_binaries=True,
     # 2026-09-16 使用者要求：打包產出的名稱（exe 檔名／COLLECT 資料夾）
     # 從 DA005_DVR_Control_Panel 改成 Dashcam_Control_Panel，版本號格式
-    # 不變（沿用 _v2.0 這種寫法）。這支 .spec 檔案本身的檔名維持不變，
+    # 不變（沿用 _v3.0 這種寫法）。這支 .spec 檔案本身的檔名維持不變，
     # 只改實際打包出來的產物名稱。
-    name='Dashcam_Control_Panel_v2.0',
+    name='Dashcam_Control_Panel_v3.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -109,5 +113,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='Dashcam_Control_Panel_v2.0',
+    name='Dashcam_Control_Panel_v3.0',
 )

@@ -26,7 +26,7 @@ import single_instance
 
 # 主視窗標題：這裡跟下面 window.title() 用同一個常數，避免兩邊字串打錯字
 # 導致 single instance 帶到前景時 FindWindowW 找不到視窗。
-MAIN_WINDOW_TITLE = 'Dashcam Control Panel v2.0'
+MAIN_WINDOW_TITLE = 'Dashcam Control Panel v3.0'
 
 if not single_instance.try_acquire_single_instance_lock():
     single_instance.bring_existing_instance_to_front(MAIN_WINDOW_TITLE)

@@ -200,8 +200,57 @@ def draw_bell(draw, w, h, scale):
     draw.ellipse([tri_cx - dot_r, dot_cy - dot_r, tri_cx + dot_r, dot_cy + dot_r], fill=mark_color)
 
 
+def _draw_round_cap(draw, point, stroke):
+    """PIL 的 line() 沒有圓頭，端點補一個直徑 = stroke 的圓（對應 SVG stroke-linecap="round"）。"""
+    x, y = point
+    radius = stroke / 2
+    draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=ICON_COLOR)
+
+
+def _arc_points(center_x, center_y, radius, start_degrees, end_degrees, segments=24):
+    """回傳一段圓弧上的點（角度是螢幕座標：0 度向右、90 度向下）。"""
+    points = []
+    for i in range(segments + 1):
+        angle = math.radians(start_degrees + (end_degrees - start_degrees) * i / segments)
+        points.append((center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)))
+    return points
+
+
+def draw_user(draw, w, h, scale):
+    """2026-10-15 新增：左下角大頭貼的人形（screen_fake_ui._load_avatar_photo()
+    用這張圖的 alpha 當形狀，再套上 icon 顏色）。
+
+    原本的 assets/icons/user.png 是一張 18x18、全白、沒有透明度（RGB）的圖，
+    alpha 整片都是 255，套色後整個方塊都變成 icon 顏色，所以畫面上只剩
+    「藍色圓形裡一個灰色正方形」。這裡照原始 user.svg（Lucide user icon，
+    viewBox 24x24、stroke-width 2、round cap/join）的座標重畫一次：
+        頭：circle cx=12 cy=7 r=4
+        肩：M19 21 v-2 a4 4 0 0 0 -4 -4 H9 a4 4 0 0 0 -4 4 v2
+    顯示尺寸約 27px（44 * 0.62），ASSET_SIZE=256 約 9.5 倍，在 4x~8x 附近，
+    線寬照 SVG 比例（2/24）縮放，縮小後約 2.2px，不會變成次像素寬度。"""
+    unit = w / 24            # SVG 的 1 個單位 = 幾個 pixel
+    stroke = round(2 * unit)
+
+    # 頭：SVG 的 stroke 是置中在圓周上，PIL 的 outline 是往內畫，所以外框半徑要加 stroke/2
+    head_cx, head_cy = 12 * unit, 7 * unit
+    outer_radius = 4 * unit + stroke / 2
+    draw.ellipse([head_cx - outer_radius, head_cy - outer_radius,
+                  head_cx + outer_radius, head_cy + outer_radius],
+                 outline=ICON_COLOR, width=stroke)
+
+    # 肩：右邊直線往上 -> 右肩圓角 -> 橫線 -> 左肩圓角 -> 左邊直線往下
+    shoulder_points = [(19 * unit, 21 * unit)]
+    shoulder_points += _arc_points(15 * unit, 19 * unit, 4 * unit, 0, -90)     # (19,19) -> (15,15)
+    shoulder_points += _arc_points(9 * unit, 19 * unit, 4 * unit, -90, -180)   # (9,15) -> (5,19)
+    shoulder_points.append((5 * unit, 21 * unit))
+    draw.line(shoulder_points, fill=ICON_COLOR, width=stroke, joint='curve')
+    _draw_round_cap(draw, shoulder_points[0], stroke)
+    _draw_round_cap(draw, shoulder_points[-1], stroke)
+
+
 if __name__ == '__main__':
     render(draw_home, 'home.png')
     render(draw_navigation, 'navigation.png')
     render(draw_phone, 'phone.png')
     render(draw_bell, 'bell.png')
+    render(draw_user, 'user.png')
