@@ -672,6 +672,8 @@ def _enter_settings_screen():
     show_screen('settings')
     screen_settings.refresh_dvr_mode_display()
     screen_settings.refresh_format_button_state()
+    # 2026-10-14：Recording Mode 每次進 Settings 都背景 GET 一次裝置實際值
+    screen_settings.load_recording_mode_from_device()
 
 
 def go_back_from_settings():

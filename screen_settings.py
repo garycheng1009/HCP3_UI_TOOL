@@ -52,6 +52,7 @@ from PIL import ImageTk
 
 import api
 import audi_pb2
+import recording_mode_service
 import screen_gallery
 import screen_recording
 import ui_shapes
@@ -91,6 +92,25 @@ SWITCH_KNOB_COLOR = screen_gallery.TEXT_PRIMARY_COLOR
 # （sd_card_title），不要另外自訂新的字體大小——這裡定義成共用常數，
 # 兩邊都讀同一個值，之後不會有「兩處各自寫一份、忘記同步改」的風險。
 SETTINGS_ROW_TITLE_FONT = ('Calibri', 12, 'bold')
+
+# 2026-10-14 新增：Recording Mode 二選一 segmented control（4K / 1080P）。
+# 第二版接上 RD 的 API（CameraConfiguration.resolution_setting，protobuf/
+# RESTful 細節全部在 recording_mode_service.py）：
+# - 每次進 Settings 背景 GET 一次實際值，依結果決定高亮哪一個（不再寫死 4K）
+# - 點選後背景 PUT，成功才算數；失敗恢復原本選項並顯示錯誤
+# - HTTP 一律在背景 thread，不會卡住 UI
+RECORDING_MODE_4K = recording_mode_service.RECORDING_MODE_4K
+RECORDING_MODE_1080P = recording_mode_service.RECORDING_MODE_1080P
+RECORDING_MODE_OPTIONS = (RECORDING_MODE_4K, RECORDING_MODE_1080P)
+SEGMENT_WIDTH = 150         # 每個選項的寬度
+SEGMENT_HEIGHT = 34         # 整條 segmented control 的高度
+SEGMENT_INSET = 3           # 選中項目（亮色塊）跟外框之間留的空隙
+SEGMENT_ACTIVE_COLOR = SWITCH_ON_COLOR   # 跟 Switch ON 同一個綠色，代表「目前選中」
+
+current_recording_mode = None   # 裝置上目前「確認過」的值；None = 還沒讀到／讀取失敗／不是 4K 也不是 1080P
+recording_mode_busy = False     # 背景 GET 或 PUT 進行中：這段期間點擊一律忽略，避免兩個請求互相蓋掉
+recording_mode_canvas = None
+recording_mode_status_label = None
 
 DvrSystemState = audi_pb2.DvrMode.DvrSystemState
 
@@ -234,6 +254,172 @@ def _create_expandable_section(parent, header_text, default_expanded=True):
     title_label.bind('<Button-1>', toggle)
 
     return content_frame
+
+
+def _draw_recording_mode_selector(highlighted_mode):
+    """重畫 Recording Mode segmented control：整條是 CONTROL_COLOR 的
+    膠囊外框，highlighted_mode 那一格疊一塊綠色膠囊＋白色粗體字，其他
+    格維持次要文字顏色（secondary style）。highlighted_mode 是 None 時
+    兩格都不高亮（還沒讀到裝置的值，或讀到的不是 4K / 1080P）。"""
+    canvas = recording_mode_canvas
+    if canvas is None:
+        return
+    canvas.delete('all')
+
+    total_width = SEGMENT_WIDTH * len(RECORDING_MODE_OPTIONS)
+    track_image = ui_shapes.make_pill_photo_image(total_width, SEGMENT_HEIGHT,
+                                                  fill=screen_gallery.CONTROL_COLOR)
+    canvas.create_image(0, 0, image=track_image, anchor='nw')
+
+    active_width = SEGMENT_WIDTH - SEGMENT_INSET * 2
+    active_height = SEGMENT_HEIGHT - SEGMENT_INSET * 2
+    active_image = ui_shapes.make_pill_photo_image(active_width, active_height, fill=SEGMENT_ACTIVE_COLOR)
+
+    for index, mode in enumerate(RECORDING_MODE_OPTIONS):
+        segment_left = index * SEGMENT_WIDTH
+        text_center_x = segment_left + SEGMENT_WIDTH / 2
+        text_center_y = SEGMENT_HEIGHT / 2
+
+        if mode == highlighted_mode:
+            canvas.create_image(segment_left + SEGMENT_INSET, SEGMENT_INSET, image=active_image, anchor='nw')
+            canvas.create_text(text_center_x, text_center_y, text=mode, font=('Calibri', 10, 'bold'),
+                               fill=screen_gallery.TEXT_PRIMARY_COLOR)
+        else:
+            canvas.create_text(text_center_x, text_center_y, text=mode, font=('Calibri', 10),
+                               fill=screen_gallery.TEXT_SECONDARY_COLOR)
+
+    canvas.recording_mode_image_refs = (track_image, active_image)  # 避免 PhotoImage 被 GC 回收
+
+
+def _set_recording_mode_status(text):
+    if recording_mode_status_label is not None:
+        recording_mode_status_label.config(text=text)
+
+
+def on_recording_mode_clicked(event):
+    """依點擊的 x 座標判斷點到哪一格（左邊 4K、右邊 1080P）。"""
+    if recording_mode_busy:
+        print('[Settings] Recording Mode 讀取／切換中，這次點擊忽略')
+        return
+    clicked_index = int(event.x // SEGMENT_WIDTH)
+    if clicked_index < 0 or clicked_index >= len(RECORDING_MODE_OPTIONS):
+        return
+    clicked_mode = RECORDING_MODE_OPTIONS[clicked_index]
+    if clicked_mode == current_recording_mode:
+        return  # 點到已選中的項目，不需要做任何事
+    on_recording_mode_changed(clicked_mode)
+
+
+# ---------- 進 Settings：背景 GET 實際值 ----------
+
+def load_recording_mode_from_device():
+    """每次進 Settings 時呼叫（DA005ControlPanel.pyw 的 _enter_settings_screen()）。
+    背景 GET，不卡 UI；GET 完成前維持上一次確認過的高亮。
+    正在 PUT 的話就不讀，PUT 完成時本來就會更新畫面。"""
+    global recording_mode_busy
+    if recording_mode_busy:
+        return
+    recording_mode_busy = True
+    _set_recording_mode_status('Loading recording mode...')
+    thread = threading.Thread(target=_load_recording_mode_worker, daemon=True)
+    thread.start()
+
+
+def _load_recording_mode_worker():
+    try:
+        mode = recording_mode_service.get_recording_mode()
+    except Exception as error:
+        print(f'[Settings] 讀取 Recording Mode 失敗: {error}')
+        recording_mode_canvas.after(0, lambda: _on_recording_mode_loaded(None, False))
+        return
+    recording_mode_canvas.after(0, lambda: _on_recording_mode_loaded(mode, True))
+
+
+def _on_recording_mode_loaded(mode, succeeded):
+    """main thread：GET 完成。失敗或讀到 4K/1080P 以外的值都不高亮，
+    只在狀態文字說明，不跳 messagebox（進頁面就跳錯誤視窗太打擾）。"""
+    global recording_mode_busy, current_recording_mode
+    recording_mode_busy = False
+    current_recording_mode = mode
+    _draw_recording_mode_selector(current_recording_mode)
+
+    if not succeeded:
+        _set_recording_mode_status('Unable to read recording mode.')
+    elif mode is None:
+        _set_recording_mode_status('Current recording mode is not 4K or 1080P.')
+    else:
+        _set_recording_mode_status('')
+
+
+# ---------- 使用者點選：背景 PUT ----------
+
+def on_recording_mode_changed(mode):
+    """使用者選了另一個 Recording Mode：先把高亮移到新選項（讓使用者知道
+    有反應），背景 PUT；成功才更新 current_recording_mode，失敗恢復原本的
+    高亮並顯示錯誤。"""
+    global recording_mode_busy
+    recording_mode_busy = True
+    previous_mode = current_recording_mode
+    print(f'[Settings] Recording Mode 切換：{previous_mode} -> {mode}')
+    _draw_recording_mode_selector(mode)
+    _set_recording_mode_status(f'Switching to {mode}...')
+    thread = threading.Thread(target=_apply_recording_mode_worker, args=(mode, previous_mode), daemon=True)
+    thread.start()
+
+
+def _apply_recording_mode_worker(mode, previous_mode):
+    try:
+        recording_mode_service.apply_recording_mode(mode)
+    except Exception as error:
+        print(f'[Settings] 切換 Recording Mode 失敗: {error}')
+        recording_mode_canvas.after(0, lambda captured_error=error: _on_recording_mode_apply_failed(previous_mode, captured_error))
+        return
+    recording_mode_canvas.after(0, lambda: _on_recording_mode_apply_succeeded(mode))
+
+
+def _on_recording_mode_apply_succeeded(mode):
+    global recording_mode_busy, current_recording_mode
+    recording_mode_busy = False
+    current_recording_mode = mode
+    print(f'[Settings] Recording Mode 已切換為 {mode}')
+    _draw_recording_mode_selector(current_recording_mode)
+    _set_recording_mode_status('')
+
+
+def _on_recording_mode_apply_failed(previous_mode, error):
+    global recording_mode_busy
+    recording_mode_busy = False
+    _draw_recording_mode_selector(previous_mode)  # 恢復原本的選項
+    _set_recording_mode_status('')
+    messagebox.showerror('Error', f'Failed to change recording mode. Please try again.\n{error}')
+
+
+def _create_recording_mode_card(parent):
+    """Recording Mode 卡片：標題 + 二選一 segmented control。外觀跟
+    SD Card 卡片一致（ROW_COLOR 底色、SETTINGS_ROW_TITLE_FONT 標題、
+    padx=16/pady=(14,8) 標題間距）。"""
+    global recording_mode_canvas, recording_mode_status_label
+
+    card = tk.Frame(parent, bg=screen_gallery.ROW_COLOR)
+    card.pack(fill='x', padx=20, pady=(4, 4))
+
+    title_label = tk.Label(card, text='Recording Mode', font=SETTINGS_ROW_TITLE_FONT,
+                            bg=screen_gallery.ROW_COLOR, fg=screen_gallery.TEXT_PRIMARY_COLOR)
+    title_label.pack(anchor='w', padx=16, pady=(14, 8))
+
+    total_width = SEGMENT_WIDTH * len(RECORDING_MODE_OPTIONS)
+    recording_mode_canvas = tk.Canvas(card, width=total_width, height=SEGMENT_HEIGHT,
+                                       bg=screen_gallery.ROW_COLOR, highlightthickness=0, cursor='hand2')
+    recording_mode_canvas.pack(anchor='w', padx=16, pady=(0, 4))
+    recording_mode_canvas.bind('<Button-1>', on_recording_mode_clicked)
+
+    # 讀取中／切換中／讀取失敗的提示文字，平常是空的
+    recording_mode_status_label = tk.Label(card, text='', font=('Calibri', 10),
+                                           bg=screen_gallery.ROW_COLOR, fg=screen_gallery.TEXT_SECONDARY_COLOR)
+    recording_mode_status_label.pack(anchor='w', padx=16, pady=(0, 10))
+
+    # 實際值要等進 Settings 時背景 GET（load_recording_mode_from_device()），先不高亮
+    _draw_recording_mode_selector(current_recording_mode)
 
 
 def _create_engineering_tool_card(parent, title_text, button_text, on_click, pady):
@@ -380,6 +566,9 @@ def build_screen(parent, on_back, on_open_race_track=None, on_open_iq_adjustment
     for sub_label in ('Headlight flasher', 'Hazard warning lights',
                        'When active front assist is triggered', 'Heavy braking'):
         _create_mock_toggle_row(start_event_content, sub_label, default_on=True, indent=True)
+
+    # ---- Recording Mode（2026-10-14 新增，純 UI，見 _create_recording_mode_card() 說明）----
+    _create_recording_mode_card(content_inner)
 
     # ---- SD Card ----
     sd_card_card = tk.Frame(content_inner, bg=screen_gallery.ROW_COLOR)
